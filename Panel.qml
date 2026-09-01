@@ -32,6 +32,7 @@ Panel {
   readonly property int nominalContentWidth: Style.space(520)
   readonly property int nominalContentHeight: Style.space(440)
   readonly property var keyboardPanel: panel
+  readonly property Item normalKeyboardTarget: normalKeys
   readonly property var editorViewport: editorScroll
   // The dashboard deliberately keeps its full composition. Editors instead
   // fit their laid-out content, up to the same screen-aware maximum.
@@ -739,6 +740,9 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // PanelKeyCatcher defaults focus:true; as a sibling that would steal
+      // the live layer-surface focus back from normalKeys despite focusTarget.
+      focus: false
       blocked: true
 
       // Both normal content and every editor occupy the same fitted viewport.

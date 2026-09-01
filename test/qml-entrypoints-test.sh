@@ -353,6 +353,8 @@ ShellRoot {
         widget.open()
         check(widget.opened, "open forwards to nested panel")
         check(fakeBar.activePopout === widget, "open claims popout as host widget")
+        check(nightPanel.keyboardPanel.focusTarget === nightPanel.normalKeyboardTarget,
+          "normal mode routes live focus to its conflict-free key target")
         var fixedWidth = nightPanel.keyboardPanel.contentWidth
         var dashboardHeight = nightPanel.targetPanelContentHeight
         heightCaptures.dashboard = ({ mode: "normal", target: dashboardHeight,
