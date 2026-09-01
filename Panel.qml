@@ -32,7 +32,7 @@ Panel {
   readonly property int nominalContentWidth: Style.space(520)
   readonly property int nominalContentHeight: Style.space(440)
   readonly property var keyboardPanel: panel
-  readonly property Item normalKeyboardTarget: normalKeys
+  readonly property Item normalKeyboardTarget: keyCatcher
   readonly property var editorViewport: editorScroll
   // The dashboard deliberately keeps its full composition. Editors instead
   // fit their laid-out content, up to the same screen-aware maximum.
@@ -453,7 +453,7 @@ Panel {
     manualSearchObservedBusy = false
     autoSearchObservedBusy = false
     resultIndex = 0
-    if (restoreFocus !== false) Qt.callLater(function() { normalKeys.forceActiveFocus() })
+    if (restoreFocus !== false) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function useWeather() {
@@ -712,9 +712,15 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: true
-    focusTarget: root.editorMode === "normal" ? normalKeys : editorKeys
+    focusTarget: root.editorMode === "normal" ? keyCatcher : editorKeys
     contentWidth: panel.fittedContentWidth(root.nominalContentWidth)
     contentHeight: root.targetPanelContentHeight
+    // Observe normal-mode keys before the focused native catcher can consume
+    // h/l as movement. Editor keys remain owned by editorKeys below.
+    Keys.priority: Keys.BeforeItem
+    Keys.onPressed: function(event) {
+      if (root.editorMode === "normal") root.handleNormalKey(event)
+    }
 
     // Only the lower card edge moves on the common top-bar layout; content
     // remains top-aligned, so controls do not reflow underneath the pointer.
@@ -727,22 +733,11 @@ Panel {
       NumberAnimation { id: panelHeightAnimation; duration: 140; easing.type: Easing.OutCubic }
     }
 
-    Item {
-      id: normalKeys
-      anchors.fill: parent
-      focus: true
-      Keys.priority: Keys.BeforeItem
-      Keys.onPressed: function(event) { root.handleNormalKey(event) }
-    }
-
-    // Retain the native semantic catcher as the content host, but block its
-    // conflicting h/l mapping; normalKeys above owns the complete key map.
+    // Retain the native semantic catcher as the focused content host, but
+    // block its mapping; the parent KeyboardPanel owns the complete key map.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // PanelKeyCatcher defaults focus:true; as a sibling that would steal
-      // the live layer-surface focus back from normalKeys despite focusTarget.
-      focus: false
       blocked: true
 
       // Both normal content and every editor occupy the same fitted viewport.
