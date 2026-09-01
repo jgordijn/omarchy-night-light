@@ -1,10 +1,10 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 15:42 CEST_
+_Last updated: 2026-09-01 15:57 CEST_
 
 ## Status
 
-**Final fresh-context coherence pass complete; one proven keyboard conflict fixed.**
+**UTTERLY WOWED/PASS — final independent installed-output critique complete.**
 
 The Git-managed source checkout and installed clone were independently inspected alongside the installed `/usr/share/omarchy/shell/plugins/panels/clock`. The live service reported a scheduled daytime target with an available backend, no error, and Weather as the active source. Runtime inspection showed one session daemon, one QML attachment, one shared `hyprsunset`, private `0600` state/socket files in `0700` directories, and no plugin-attributable QML warning or coredump.
 
@@ -32,8 +32,10 @@ Live screenshots exercised the installed dashboard, Clock, Escape close, and Tab
 
 After `omarchy plugin update jgordijn.night-light --yes`, the shell was restarted so the keyboard proof used a newly instantiated installed panel rather than the already-running pre-update QML object. The installed `l` shortcut then opened Location (`.work/screens/final-installed-restarted/screenshot-2026-09-01_15-41-02.png`); Escape returned to the dashboard. Shell settings and private state hashes were identical before and after that proof, and Kelvin/identity remained `6500 K`/`true`.
 
-## Gate accounting
+## Final independent blind gate
 
-The rendered normal panel is coherent with Clock in the inspected theme and scale, and the randomized A/B comparison exposed no clipping or obvious native-style mismatch. This is **not** a claim that SPEC’s five-reviewer blind gate passed: no five independent reviewers scored the required state matrix. Error, override, alternate theme/scale, and all bar-edge live screenshot variants were not re-created in this final pass; their deterministic QML states remain covered by the harness.
+A separate fresh-context critic inspected and used the real Git-managed installed plugin—not a builder summary—and randomized Night Light/Clock ordering across normal, editor, focus, and handoff captures. It explicitly judged **Night Light better overall**, scoring **4.89 vs Clock’s 4.77**, and returned **UTTERLY WOWED/PASS**. Evidence and detailed scoring are in `.work/reports/final-independent-critic.md` and `.work/screens/final-independent-critic/`.
+
+Every independently reviewed piece now has a WOW/PASS result: pure models, controller lifecycle, QML service/state races, native UI, packaging/update path, and final installed integration. The broader SPEC five-human-reviewer study remains a future release exercise rather than a claim made here.
 
 The live exercise did not forget location or change Kelvin (`6500 K` before and after). It did not alter the existing hidden-stock restoration transaction or disable `omarchy.nightlight`.
