@@ -493,7 +493,7 @@ Use `qs.Ui.Panel`, `KeyboardPanel`, `PanelKeyCatcher`, `PanelActionButton`, `Tex
 Visual hierarchy:
 
 1. Hero icon and state title
-2. One next-event sentence and source badge
+2. One next-event sentence and inline location provenance
 3. Sunset-to-sunrise progress rail with fixed labels
 4. Three fixed rows: `AUTOMATIC`, `WARMTH`, `TRANSITION`
 5. Location/action footer
@@ -515,7 +515,7 @@ Exact primary runtime copy:
 | backend error | `Night Light is unavailable` | `hyprsunset did not respond. Your schedule is still saved.` |
 | calculation error | `Schedule unavailable` | `The last display setting was left unchanged.` |
 
-Source badges are `Weather`, `Manual`, `Coordinates`, `Approximate`, or `Last known · {age}`. Calculated event copy must not claim observed horizon accuracy.
+Location provenance follows the location name as quiet italic copy: `via Weather`, `via Manual`, `via Coordinates`, `via Approximate`, or `via Last known · {age}`. It is informational, not an outlined control or interactive tag. Calculated event copy must not claim observed horizon accuracy.
 
 Normal actions are `Warm now` or `Use daylight`, `Resume automatic` when overridden, `Change location`, and `Retry` only when actionable. Warmth changes in 250 K steps; transition choices are `Instant`, `30 min`, `45 min`, `60 min`, and `90 min` (hand-edited valid values still render numerically).
 

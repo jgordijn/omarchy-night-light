@@ -895,9 +895,10 @@ Panel {
               height: Style.space(26)
 
               Text {
+                id: locationLabel
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                width: Math.max(0, parent.width - sourcePill.width - Style.space(18))
+                width: Math.min(implicitWidth, Math.max(0, parent.width - (sourceText.visible ? sourceText.implicitWidth + Style.space(8) : 0)))
                 text: root.locationState && root.locationState.label ? String(root.locationState.label) : (root.runtimeMode === "setup" ? "No schedule location" : "Schedule location unavailable")
                 color: root.dimForeground
                 font.family: root.contentFontFamily
@@ -905,25 +906,17 @@ Panel {
                 elide: Text.ElideRight
               }
 
-              BorderSurface {
-                id: sourcePill
-                anchors.right: parent.right
+              Text {
+                id: sourceText
+                anchors.left: locationLabel.right
+                anchors.leftMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
-                implicitWidth: sourceText.implicitWidth + Style.space(12)
-                implicitHeight: Math.max(Style.space(24), sourceText.implicitHeight + Style.space(6))
-                color: "transparent"
-                borderSpec: Border.controlSpec("normal", root.contentForeground, Color.accent)
-                radius: Style.cornerRadius
-
-                Text {
-                  id: sourceText
-                  anchors.centerIn: parent
-                  text: root.sourceBadge
-                  color: root.dimForeground
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
+                visible: root.locationState !== null
+                text: "via " + root.sourceBadge
+                color: root.dimForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.italic: true
               }
             }
 
