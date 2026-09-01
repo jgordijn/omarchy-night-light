@@ -384,7 +384,7 @@ The controller has one command in flight and one latest pending desired state. I
 Discovery is scoped to `HYPRLAND_INSTANCE_SIGNATURE`: inspect the compositor socket and `/proc/<pid>/{exe,environ,stat}`, never global `pgrep`. If IPC works, adopt the existing daemon as shared. If a matching process exists but IPC is starting, wait up to 5 seconds. Only if neither exists may the controller launch:
 
 ```text
-/usr/bin/uwsm-app -- /usr/bin/hyprsunset --config /dev/null --identity
+/usr/bin/uwsm-app -- /usr/bin/hyprsunset --identity
 ```
 
 Record exact executable, compositor signature, PID, process start time, and ownership. Never manage `hyprsunset.service`, kill an unowned process, call `omarchy toggle nightlight`, or start a second daemon.

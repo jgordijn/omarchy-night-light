@@ -498,6 +498,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             created = threading.Event()
             launch_gate = threading.Event()
             child_holder = []
+            launch_argv = []
             real_popen = subprocess.Popen
             sleep_executable = os.path.realpath("/usr/bin/sleep")
             actual = controller.Actual("identity", 6500, 100)
@@ -511,6 +512,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 backend = controller.Backend()
 
                 def blocked_popen(*_args, **_kwargs):
+                    launch_argv.append(_args[0])
                     # Model Popen having forked the configured daemon while the
                     # to_thread call has not returned to initialize() yet.
                     child = real_popen(
@@ -573,6 +575,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.wait_for(closing, 2)
 
                     self.assertTrue(backend.started)
+                    self.assertEqual(launch_argv, [[
+                        "/fake/uwsm-app", "--", sleep_executable, "--identity",
+                    ]])
                     self.assertEqual(backend.owned_pid, child.pid)
                     self.assertGreaterEqual(probe_calls, 3, "release failure path was not exercised")
                     child.wait(timeout=1)
@@ -709,6 +714,26 @@ class BlockedProbeBackend(SlowBackend):
         return self.probed_actual
 
 
+class VanishingBackend(SlowBackend):
+    """Backend whose daemon disappears once, then initialize recreates it."""
+
+    def __init__(self):
+        super().__init__()
+        self.missing = True
+        self.initialize_calls = 0
+
+    async def initialize(self):
+        self.initialize_calls += 1
+        self.missing = False
+        self.actual = controller.Actual("identity", 6500, 100)
+        return self.actual
+
+    async def probe(self, *, publish=True):
+        if self.missing:
+            raise RuntimeError("backend disappeared")
+        return await super().probe(publish=publish)
+
+
 class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     async def wait_until(predicate, timeout=1.0):
@@ -716,6 +741,29 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
             while not predicate():
                 await asyncio.sleep(0.005)
         await asyncio.wait_for(poll(), timeout)
+
+    async def test_health_restarts_backend_that_disappears_after_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            daemon.backend = VanishingBackend()
+            daemon.backend_ready = True
+            writer = MemoryStreamWriter()
+            client = controller.Client(asyncio.StreamReader(), writer)
+            daemon.activate_client(client)
+
+            await daemon._health_iteration()
+
+            self.assertEqual(daemon.backend.initialize_calls, 1)
+            self.assertTrue(daemon.backend_ready)
+            self.assertIsNone(daemon.backend_error)
+            self.assertEqual(writer.messages(), [{
+                "protocol": 1,
+                "type": "backendStatus",
+                "available": True,
+                "actual": {"kind": "identity", "temperature": 6500, "gamma": 100},
+                "override": None,
+                "error": None,
+            }])
 
     async def test_rate_limit_wait_is_token_aware_and_identity_preempts(self):
         with tempfile.TemporaryDirectory() as temporary:
