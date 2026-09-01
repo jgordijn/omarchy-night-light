@@ -82,6 +82,223 @@ test('validateSettings rejects every invalid field without partially defaulting 
   assert.equal('value' in rejected, false)
 })
 
+test('settings read only own fields and support null-prototype transactions', () => {
+  const inherited = Object.create({
+    automationEnabled: false,
+    nightTemperature: 1000,
+    transitionMinutes: 180,
+    ok: true,
+    value: { automationEnabled: false, nightTemperature: 1000, transitionMinutes: 180 }
+  })
+  assert.deepEqual(Schedule.validateSettings(inherited).value, {
+    automationEnabled: true,
+    nightTemperature: 4000,
+    transitionMinutes: 45
+  })
+
+  const own = Object.create({
+    automationEnabled: true,
+    nightTemperature: 6500,
+    transitionMinutes: 0
+  })
+  own.automationEnabled = false
+  own.nightTemperature = 3250
+  own.transitionMinutes = 30
+  assert.deepEqual(Schedule.validateSettings(own).value, {
+    automationEnabled: false,
+    nightTemperature: 3250,
+    transitionMinutes: 30
+  })
+
+  const nullPrototype = Object.create(null)
+  nullPrototype.automationEnabled = true
+  nullPrototype.nightTemperature = 2750
+  nullPrototype.transitionMinutes = 15
+  nullPrototype.hasOwnProperty = null
+  const validated = Schedule.validateSettings(nullPrototype)
+  assert.equal(validated.ok, true)
+  assert.deepEqual(validated.value, {
+    automationEnabled: true,
+    nightTemperature: 2750,
+    transitionMinutes: 15
+  })
+  assert.equal(Schedule.evaluate(S, events(), validated).ok, true)
+
+  for (const malformed of [{ ok: false }, { ok: true }, { ok: true, value: null }]) {
+    const result = Schedule.evaluate(S, events(), malformed)
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, 'settings-invalid')
+    assert.equal(result.target, null)
+  }
+})
+
+test('inherited event snapshots, wrappers, coordinates, and cycle items fail closed', () => {
+  const inheritedEvents = Object.create(events())
+  const inheritedCoordinates = Object.create({ latitude: 0, longitude: 0 })
+  const inheritedWrapper = Object.create({ events: events() })
+  const inheritedSolarWrapper = Object.create({ solarEvents: events() })
+  const oneInheritedCoordinate = Object.assign(Object.create({ longitude: 0 }), { latitude: 0 })
+  const nestedInheritedEvents = {
+    status: 'normal',
+    events: [Object.create({ sunsetMs: S, sunriseMs: R })]
+  }
+
+  for (const location of [inheritedEvents, inheritedCoordinates, inheritedWrapper,
+    inheritedSolarWrapper, oneInheritedCoordinate, nestedInheritedEvents]) {
+    const result = Schedule.evaluate(S, location, settings())
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, 'calculation-failed')
+    assert.equal(result.target, null)
+  }
+
+  const nullEvents = Object.create(null)
+  nullEvents.ok = true
+  nullEvents.status = 'normal'
+  nullEvents.sunsetMs = S
+  nullEvents.sunriseMs = R
+  assert.deepEqual(Schedule.evaluate(S, nullEvents, settings()),
+    Schedule.evaluate(S, events(), settings()))
+
+  const nullCoordinates = Object.create(null)
+  nullCoordinates.latitude = 0
+  nullCoordinates.longitude = 0
+  const direct = Schedule.evaluate(S, nullCoordinates, settings())
+  assert.equal(direct.ok, true)
+  assert.deepEqual(direct,
+    Schedule.evaluate(S, Solar.surroundingEvents(S, 0, 0), settings()))
+})
+
+test('nested event collections accept only small dense arrays of own event objects', () => {
+  const dense = Array.from({ length: 8 }, () => ({}))
+  dense[3] = { sunsetMs: S }
+  dense[4] = { sunriseMs: R }
+  const accepted = Schedule.evaluate(S, { status: 'normal', cycles: dense }, settings())
+  assert.equal(accepted.ok, true)
+  assert.equal(accepted.sunsetMs, S)
+  assert.equal(accepted.sunriseMs, R)
+
+  const sparse = new Array(8)
+  sparse[0] = { sunsetMs: S, sunriseMs: R }
+  const accessor = []
+  let accessorRead = false
+  Object.defineProperty(accessor, '0', {
+    configurable: true,
+    get() { accessorRead = true; return { sunsetMs: S, sunriseMs: R } }
+  })
+  const arrayLike = Object.create(null)
+  Object.defineProperty(arrayLike, 'length', {
+    get() { throw new Error('array-like length must not be read') }
+  })
+  const revoked = Proxy.revocable([], {})
+  revoked.revoke()
+
+  const rejected = [
+    sparse,
+    accessor,
+    Array.from({ length: 9 }, () => ({})),
+    arrayLike,
+    revoked.proxy,
+    'not an event array'
+  ]
+  for (const collection of rejected) {
+    const result = Schedule.evaluate(S, Object.assign(events(), { cycles: collection }), settings())
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, 'calculation-failed')
+    assert.equal(result.target, null)
+  }
+  const polarWithCollection = Schedule.evaluate(S, {
+    status: 'polar-day',
+    cycles: Array.from({ length: 9 }, () => ({}))
+  }, settings())
+  assert.equal(polarWithCollection.ok, false)
+  assert.equal(polarWithCollection.target, null)
+  assert.equal(accessorRead, false)
+})
+
+test('maximum sparse event-array length is rejected within a hard subprocess timeout',
+  { timeout: 4000 }, () => {
+    const schedulePath = JSON.stringify(path.resolve(__dirname, '../ScheduleModel.js'))
+    const script = `const s=require(${schedulePath});` +
+      `const cycles=[];cycles.length=0xffffffff;` +
+      `const result=s.evaluate(${S},{ok:true,status:'normal',sunsetMs:${S},` +
+      `sunriseMs:${R},cycles},{automationEnabled:true,nightTemperature:4000,` +
+      `transitionMinutes:60});` +
+      `process.stdout.write(JSON.stringify(result));`
+    const child = spawnSync(process.execPath, ['-e', script], {
+      encoding: 'utf8', timeout: 1000
+    })
+
+    assert.equal(child.error, undefined, child.error && child.error.message)
+    assert.equal(child.status, 0, child.stderr)
+    const result = JSON.parse(child.stdout)
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, 'calculation-failed')
+    assert.equal(result.target, null)
+  })
+
+test('event enums and retained polar events use exact own data properties', () => {
+  for (const status of ['constructor', 'toString', {}, Symbol('normal')]) {
+    const result = Schedule.evaluate(S, {
+      status,
+      sunsetMs: S,
+      sunriseMs: R
+    }, settings())
+    assert.equal(result.ok, false)
+    assert.equal(result.target, null)
+  }
+
+  const inheritedNext = Object.create({ kind: 'sunset', epochMs: S + HOUR })
+  const polar = Schedule.evaluate(S, {
+    status: 'polar-day',
+    nextEvent: inheritedNext
+  }, settings())
+  assert.equal(polar.ok, true)
+  assert.equal(polar.nextBoundaryMs, 0)
+
+  const ownNext = Object.assign(Object.create({ kind: 'sunrise', epochMs: R }), {
+    kind: 'sunset', epochMs: S + HOUR
+  })
+  const bounded = Schedule.evaluate(S, {
+    status: 'polar-day',
+    nextEvent: ownNext
+  }, settings())
+  assert.equal(bounded.ok, true)
+  assert.equal(bounded.nextBoundaryMs, S + HOUR)
+})
+
+test('Object.prototype pollution cannot change defaults or supply a location', () => {
+  const schedulePath = JSON.stringify(path.resolve(__dirname, '../ScheduleModel.js'))
+  const script = `const s=require(${schedulePath});` +
+    `const at=${S},rise=${R};` +
+    `const pollution={automationEnabled:false,nightTemperature:1000,transitionMinutes:180,` +
+    `ok:false,status:'polar-night',phase:'polar-night',kind:'sunrise',latitude:0,longitude:0,` +
+    `sunsetMs:at,sunriseMs:rise,nextSunsetMs:at+1,nextSunriseMs:rise,` +
+    `events:{status:'normal',sunsetMs:at,sunriseMs:rise},` +
+    `solarEvents:{status:'normal',sunsetMs:at,sunriseMs:rise},` +
+    `nextEvent:{kind:'sunset',epochMs:at+1},previousEvent:{kind:'sunset',epochMs:at-1}};` +
+    `for(const key of Object.keys(pollution))Object.defineProperty(Object.prototype,key,` +
+    `{configurable:true,enumerable:true,value:pollution[key],writable:true});` +
+    `const defaults=s.validateSettings({});` +
+    `const valid=s.evaluate(at,{status:'normal',sunsetMs:at,sunriseMs:rise},{});` +
+    `const absent=s.evaluate(at,{},{});` +
+    `process.stdout.write(JSON.stringify({defaults,valid,absent}));`
+  const child = spawnSync(process.execPath, ['-e', script], {
+    encoding: 'utf8', timeout: 2000
+  })
+  assert.equal(child.error, undefined, child.error && child.error.message)
+  assert.equal(child.status, 0, child.stderr)
+  const payload = JSON.parse(child.stdout)
+  assert.deepEqual(payload.defaults.value, {
+    automationEnabled: true,
+    nightTemperature: 4000,
+    transitionMinutes: 45
+  })
+  assert.equal(payload.valid.ok, true)
+  assert.equal(payload.valid.phase, 'evening-transition')
+  assert.equal(payload.absent.ok, false)
+  assert.equal(payload.absent.target, null)
+})
+
 test('all positive-duration boundaries have exact phase, warmth, and target semantics', () => {
   const d = HOUR
   const cases = [

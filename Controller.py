@@ -555,6 +555,7 @@ class Backend:
         self.owned_pid: int | None = None
         self.owned_start: str | None = None
         self.owned_exe: str | None = None
+        self.owned_signature: str | None = None
         self.started = False
         self.command_lock = asyncio.Lock()
         self.accepting_applies = True
@@ -683,7 +684,7 @@ class Backend:
             raise RuntimeError("backend value out of range")
         return value
 
-    async def _probe_locked(self) -> Actual:
+    async def _probe_locked(self, *, publish: bool = True) -> Actual:
         """Probe while command_lock is held by the caller."""
         identity_text = await self._run([self.hyprctl, "hyprsunset", "identity", "get"])
         temperature_text = await self._run([self.hyprctl, "hyprsunset", "temperature"])
@@ -700,20 +701,60 @@ class Backend:
             self._integer(temperature_text, 1000, 20000),
             self._integer(gamma_text, 1, 1000),
         )
-        self.actual = actual
+        if publish:
+            self.actual = actual
         return actual
 
-    async def probe(self) -> Actual:
-        async with self.command_lock:
-            return await self._probe_locked()
+    def _reconcile_attempt(self, actual: Actual) -> bool:
+        """Resolve one uncertain mutation against a serialized observation."""
+        attempt = self.last_attempt
+        if attempt is not None:
+            # Once the mutating child has stopped, its attempt has exactly one
+            # truthful resolution.  Do not leave a stale candidate available to
+            # a later observation or compare-and-swap release.
+            self.last_attempt = None
+            if actual.matches(attempt):
+                self.last_ack = attempt
+                return True
+        return actual.matches(self.last_ack)
 
-    def _process_info(self, pid: int) -> tuple[str, str, str] | None:
+    async def probe(self, *, publish: bool = True) -> Actual:
+        async with self.command_lock:
+            return await self._probe_locked(publish=publish)
+
+    async def probe_reconciled(
+        self,
+        accept: Callable[[], bool],
+    ) -> tuple[Actual, bool] | None:
+        """Probe and atomically resolve a possibly committed controller write.
+
+        ``accept`` is checked while the command lock still excludes another
+        controller mutation.  An obsolete attachment therefore changes neither
+        the published cache nor write ownership.
+        """
+        async with self.command_lock:
+            actual = await self._probe_locked(publish=False)
+            if not accept():
+                return None
+            owned = self._reconcile_attempt(actual)
+            self.actual = actual
+            return actual, owned
+
+    def _process_info(
+        self,
+        pid: int,
+        *,
+        signature: str | None = None,
+    ) -> tuple[str, str, str] | None:
         proc = pathlib.Path("/proc") / str(pid)
         try:
             exe = os.readlink(proc / "exe")
             environ = (proc / "environ").read_bytes().split(b"\0")
-            signature = ("HYPRLAND_INSTANCE_SIGNATURE=" + self.signature).encode()
-            if signature not in environ:
+            expected_signature = self.signature if signature is None else signature
+            signature_entry = (
+                "HYPRLAND_INSTANCE_SIGNATURE=" + expected_signature
+            ).encode()
+            if signature_entry not in environ:
                 return None
             fields = (proc / "stat").read_text().split()
             return exe, fields[21], "matched"
@@ -769,6 +810,7 @@ class Backend:
             matches = self.matching_processes()
             if len(matches) == 1:
                 self.owned_pid, self.owned_exe, self.owned_start = matches[0]
+                self.owned_signature = self.signature
             try:
                 actual = await self.probe()
                 self.baseline = actual
@@ -794,7 +836,11 @@ class Backend:
         if wait > 0:
             # Matching requests are observational and must not sit through the
             # write limiter.  A second probe below closes changes during wait.
-            actual = await self.probe()
+            actual = await self.probe(publish=False)
+            if superseded is not None and superseded.is_set():
+                raise ApplySuperseded()
+            self.actual = actual
+            self._reconcile_attempt(actual)
             if actual.matches(desired):
                 return actual
             if superseded is None:
@@ -814,7 +860,12 @@ class Backend:
             # The controller, rather than any caller-side cache, is the final
             # no-op authority.  Probe and the possible mutation share the lock
             # so daemon work cannot interleave between that decision and write.
-            actual = await self._probe_locked()
+            actual = await self._probe_locked(publish=False)
+            if superseded is not None and superseded.is_set():
+                raise ApplySuperseded()
+            self.actual = actual
+            if not restoring:
+                self._reconcile_attempt(actual)
             if actual.matches(desired):
                 return actual
 
@@ -835,28 +886,124 @@ class Backend:
                 self.last_temperature_write = time.monotonic()
             if superseded is not None and superseded.is_set():
                 raise ApplySuperseded()
-            actual = await self._probe_locked()
+            actual = await self._probe_locked(publish=False)
             # Verification can overlap an attachment handshake.  Do not turn
-            # obsolete completion into acknowledged ownership.
+            # obsolete completion into acknowledged ownership or observation.
             if superseded is not None and superseded.is_set():
                 raise ApplySuperseded()
+            self.actual = actual
             if not actual.matches(desired):
+                if not restoring:
+                    self.last_attempt = None
                 raise RuntimeError("backend verification failed")
             if not restoring:
                 self.last_ack = desired
+                self.last_attempt = None
             return actual
 
-    def _owned_still_matches(self) -> bool:
-        if self.owned_pid is None or self.owned_start is None or self.owned_exe is None:
+    def _owned_identity(self) -> tuple[int, str, str, str] | None:
+        if (
+            self.owned_pid is None
+            or self.owned_start is None
+            or self.owned_exe is None
+            or self.owned_signature is None
+        ):
+            return None
+        executable = os.path.realpath(self.owned_exe)
+        if (
+            executable != os.path.realpath(self.hyprsunset)
+            or self.owned_signature != self.signature
+        ):
+            return None
+        return (
+            self.owned_pid,
+            self.owned_start,
+            executable,
+            self.owned_signature,
+        )
+
+    def _owned_still_matches(
+        self,
+        identity: tuple[int, str, str, str] | None = None,
+    ) -> bool:
+        identity = self._owned_identity() if identity is None else identity
+        if identity is None:
             return False
-        info = self._process_info(self.owned_pid)
-        return bool(info and info[1] == self.owned_start and os.path.realpath(info[0]) == os.path.realpath(self.owned_exe))
+        pid, start, executable, signature = identity
+        info = self._process_info(pid, signature=signature)
+        return bool(
+            info
+            and info[1] == start
+            and os.path.realpath(info[0]) == executable
+        )
+
+    @staticmethod
+    async def _wait_pidfd(pidfd: int, timeout: float) -> bool:
+        """Wait a bounded time for one pidfd's exact process to exit."""
+        loop = asyncio.get_running_loop()
+        exited = loop.create_future()
+
+        def ready() -> None:
+            if not exited.done():
+                exited.set_result(None)
+
+        loop.add_reader(pidfd, ready)
+        try:
+            await asyncio.wait_for(asyncio.shield(exited), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            loop.remove_reader(pidfd)
+            if not exited.done():
+                exited.cancel()
+
+    @staticmethod
+    def _reap_pidfd(pidfd: int) -> None:
+        """Reap when this process is the parent; otherwise the owner will reap."""
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG)
+
+    async def _stop_owned_process(self) -> None:
+        """TERM, then KILL/reap only the recorded owned process identity."""
+        identity = self._owned_identity()
+        if identity is None or not self._owned_still_matches(identity):
+            return
+        pid, _start, _executable, _signature = identity
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+
+        try:
+            # Recheck after obtaining the stable pidfd.  Signals sent through it
+            # cannot hit a replacement that later reuses the numeric PID.
+            if not self._owned_still_matches(identity):
+                return
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            if await self._wait_pidfd(pidfd, PROCESS_TERMINATE_TIMEOUT):
+                self._reap_pidfd(pidfd)
+                return
+
+            # Exec or session changes revoke ownership before escalation.
+            if not self._owned_still_matches(identity):
+                raise RuntimeError("owned hyprsunset identity changed during shutdown")
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            if not await self._wait_pidfd(pidfd, PROCESS_KILL_TIMEOUT):
+                raise RuntimeError("owned hyprsunset could not be stopped")
+            self._reap_pidfd(pidfd)
+        finally:
+            os.close(pidfd)
 
     async def release(self) -> None:
-        """Restore/stop only when actual still equals our acknowledged write."""
+        """CAS-restore shared state and always stop a verified owned daemon."""
         try:
             actual = await self.probe()
         except Exception:
+            # A release probe failure prevents safe restoration, but not teardown
+            # of a process whose complete launch identity is still verified.
+            if self.started:
+                await self._stop_owned_process()
             return
         candidates = [
             candidate for candidate in (self.last_attempt, self.last_ack)
@@ -867,18 +1014,29 @@ class Backend:
             if self.baseline.kind == "temperature":
                 expected["temperature"] = self.baseline.temperature
             candidates.append(expected)
-        if candidates and not any(actual.matches(candidate) for candidate in candidates):
-            return  # An external owner won the CAS; do not touch it.
         expected = candidates[0] if candidates else None
+
         if self.started:
+            restoration_error: Exception | None = None
             try:
-                await self.apply({"kind": "identity"}, restoring=True)
-            except Exception:
-                return
-            if self._owned_still_matches():
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(self.owned_pid, signal.SIGTERM)  # type: ignore[arg-type]
+                # An external winner revokes restoration authority, but never
+                # ownership of the exact daemon this controller launched.
+                if not candidates or any(actual.matches(item) for item in candidates):
+                    await self.apply({"kind": "identity"}, restoring=True)
+            except Exception as exc:
+                restoration_error = exc
+            try:
+                await self._stop_owned_process()
+            except Exception as stop_error:
+                if restoration_error is not None:
+                    raise restoration_error from stop_error
+                raise
+            if restoration_error is not None:
+                raise restoration_error
             return
+
+        if candidates and not any(actual.matches(candidate) for candidate in candidates):
+            return  # An external owner won the CAS; do not touch shared state.
         if self.baseline is not None and expected is not None:
             target = {"kind": self.baseline.kind}
             if self.baseline.kind == "temperature":
@@ -949,6 +1107,10 @@ class ControllerDaemon:
         self.state_transaction_lock = asyncio.Lock()
         self.apply_idle = asyncio.Event()
         self.apply_idle.set()
+        # Initialization owns process-launch lifecycle state.  Keep its task
+        # independent from apply-loop cancellation so shutdown can wait until a
+        # launched daemon has either been identified or initialization failed.
+        self.initialization_task: asyncio.Task[Actual] | None = None
         self.closing = False
         self.runtime_override: dict[str, Any] | None = None
         self.last_schedule_boundary: int | None = None
@@ -969,6 +1131,23 @@ class ControllerDaemon:
         self.lock_fd = lock_fd
         return True
 
+    async def _initialize_backend(self) -> Actual:
+        """Run initialization as tracked, shutdown-visible lifecycle work."""
+        task = self.initialization_task
+        if task is None or task.done():
+            task = asyncio.create_task(self.backend.initialize())
+            self.initialization_task = task
+        self.apply_idle.clear()
+        try:
+            # Cancelling an apply must not abandon a to_thread(Popen) launch.
+            # The independent task records started/ownership before close's
+            # initialization barrier permits compare-and-swap release.
+            return await asyncio.shield(task)
+        finally:
+            self.apply_idle.set()
+            if task.done() and self.initialization_task is task:
+                self.initialization_task = None
+
     async def start(self) -> None:
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
@@ -982,7 +1161,7 @@ class ControllerDaemon:
         self.apply_task = asyncio.create_task(self.apply_loop())
         self.health_task = asyncio.create_task(self.health_loop())
         try:
-            await self.backend.initialize()
+            await self._initialize_backend()
             self.backend_ready = True
         except Exception:
             self.backend_error = "backend-unavailable"
@@ -1115,8 +1294,13 @@ class ControllerDaemon:
         # hot-reload predecessor must neither publish nor overtake the replacement.
         self.pending = None
         self.deferred = None
-        if self.apply_token is not None:
-            self.apply_token.set()
+        # Detach the predecessor's authority as part of the epoch handoff.
+        # Keeping a cancelled token installed would make the replacement's
+        # first observational probe capture authority that can never be current.
+        old_apply_token = self.apply_token
+        self.apply_token = None
+        if old_apply_token is not None:
+            old_apply_token.set()
         self.network_token = {"geocode": None, "auto": None}
         for attached in self.clients:
             if attached is client:
@@ -1159,6 +1343,23 @@ class ControllerDaemon:
             and self.apply_token is token
         )
 
+    def observation_is_current(
+        self,
+        client: Any | None,
+        expected_epoch: int,
+        expected_token: ApplyToken | None,
+    ) -> bool:
+        if self.closing or self.active_attachment_epoch != expected_epoch:
+            return False
+        if self.apply_token is not expected_token:
+            return False
+        if expected_token is not None and expected_token.is_set():
+            return False
+        if client is None:
+            return True
+        session = self.attachment_sessions.get(client)
+        return bool(session and session.epoch == expected_epoch)
+
     async def dispatch(self, client: Client, request: Any) -> None:
         valid, code = self.valid_request(request)
         if not valid:
@@ -1175,10 +1376,17 @@ class ControllerDaemon:
             return
         if operation == "probe":
             epoch = self.attachment_sessions[client].epoch
+            token = self.apply_token
             try:
-                await self.observe()
+                actual = await self.observe(client, epoch, token)
             except Exception:
-                pass
+                if not self.observation_is_current(client, epoch, token):
+                    await self.error(client, request, "stale-generation", "request is obsolete")
+                    return
+            else:
+                if actual is None:
+                    await self.error(client, request, "stale-generation", "request is obsolete")
+                    return
             await self.broadcast_status(request, client, expected_epoch=epoch)
         elif operation == "setDesired":
             if not self.accept_generation(client, "backend", generation):
@@ -1325,7 +1533,7 @@ class ControllerDaemon:
                 self.pending = None
                 if not self.backend_ready:
                     try:
-                        await self.backend.initialize()
+                        await self._initialize_backend()
                         self.backend_ready = True
                         self.backend_error = None
                     except Exception:
@@ -1384,12 +1592,25 @@ class ControllerDaemon:
                     expected_token=token,
                 )
 
-    async def observe(self) -> Actual:
+    async def observe(
+        self,
+        client: Any | None,
+        expected_epoch: int,
+        expected_token: ApplyToken | None,
+    ) -> Actual | None:
         previous = self.backend.actual
-        actual = await self.backend.probe()
+        observation = await self.backend.probe_reconciled(
+            lambda: self.observation_is_current(client, expected_epoch, expected_token)
+        )
+        # The backend checks attachment authority under the same lock as the
+        # probe and possible-attempt reconciliation.  A predecessor observation
+        # can therefore publish neither cache nor ownership after hot reload.
+        if observation is None:
+            return None
+        actual, controller_owned = observation
         self.backend_ready = True
         self.backend_error = None
-        if previous is not None and actual != previous and not actual.matches(self.backend.last_ack):
+        if previous is not None and actual != previous and not controller_owned:
             self.runtime_override = {
                 "target": {"kind": actual.kind, **({"temperature": actual.temperature} if actual.kind == "temperature" else {})},
                 "until": self.last_schedule_boundary or 0,
@@ -1403,16 +1624,24 @@ class ControllerDaemon:
     async def health_loop(self) -> None:
         while True:
             await asyncio.sleep(30)
+            epoch = self.active_attachment_epoch
+            token = self.apply_token
             try:
-                await self.observe()
+                actual = await self.observe(None, epoch, token)
+                if actual is None:
+                    continue
                 if self.deferred is not None and self.pending is None and self.runtime_override is None:
                     self.pending = self.deferred
                     self.deferred = None
                     self.apply_event.set()
             except Exception:
+                # A failed probe from superseded authority must not downgrade
+                # the replacement's backend state either.
+                if not self.observation_is_current(None, epoch, token):
+                    continue
                 self.backend_ready = False
                 self.backend_error = "backend-unavailable"
-            await self.broadcast_status()
+            await self.broadcast_status(expected_epoch=epoch)
 
     async def close(self) -> None:
         # Stop admission first.  An apply already past its final token check is
@@ -1446,11 +1675,23 @@ class ControllerDaemon:
                 self.apply_task.cancel()
             else:
                 self.apply_task.cancel()
+
+            # apply_task cancellation cannot cancel initialization: Popen may
+            # already have created hyprsunset while its to_thread caller has not
+            # returned.  Await that launch lifecycle before allowing release to
+            # inspect started/owned_pid.
+            initialization = self.initialization_task
+            if initialization is not None:
+                await asyncio.gather(initialization, return_exceptions=True)
             if stop_mutations is not None:
                 await stop_mutations()
             await asyncio.gather(self.apply_task, return_exceptions=True)
-        elif stop_mutations is not None:
-            await stop_mutations()
+        else:
+            initialization = self.initialization_task
+            if initialization is not None:
+                await asyncio.gather(initialization, return_exceptions=True)
+            if stop_mutations is not None:
+                await stop_mutations()
 
         # This barrier is deliberately immediately adjacent to release: once it
         # returns there is no old process that can perform a stale post-CAS write.

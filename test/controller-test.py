@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -166,6 +169,17 @@ if block_path and gate_path and args == ["hyprsunset", "temperature", "4100"]:
         if __import__("time").monotonic() >= deadline:
             raise SystemExit(8)
         __import__("time").sleep(0.005)
+verification_path = os.environ.get("FAKE_HYPR_BLOCK_VERIFICATION")
+verification_gate = os.environ.get("FAKE_HYPR_VERIFICATION_GATE")
+if (verification_path and verification_gate
+        and args == ["hyprsunset", "identity", "get"]
+        and not state["identity"] and state["temperature"] == 4100):
+    pathlib.Path(verification_path).write_text("entered")
+    deadline = __import__("time").monotonic() + 5
+    while not pathlib.Path(verification_gate).exists():
+        if __import__("time").monotonic() >= deadline:
+            raise SystemExit(9)
+        __import__("time").sleep(0.005)
 if args == ["hyprsunset", "identity", "get"]:
     print("true" if state["identity"] else "false")
 elif args == ["hyprsunset", "temperature"]:
@@ -173,6 +187,8 @@ elif args == ["hyprsunset", "temperature"]:
 elif args == ["hyprsunset", "gamma"]:
     print(state["gamma"])
 elif args == ["hyprsunset", "identity", "true"]:
+    if os.environ.get("FAKE_HYPR_FAIL_IDENTITY"):
+        raise SystemExit(10)
     state["identity"] = True
     state_path.write_text(json.dumps(state))
     with write_log_path.open("a") as stream: stream.write(json.dumps(args) + "\n")
@@ -283,6 +299,116 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(call[:2] == ["hyprsunset", "identity"] and call[-1] == "true" for call in later))
             self.assertFalse(any(call[:2] == ["hyprsunset", "temperature"] and len(call) == 3 for call in later))
 
+    @staticmethod
+    def record_owned_child(backend, child):
+        info = backend._process_info(child.pid)
+        if info is None:
+            raise AssertionError("fake child identity was not observable")
+        backend.started = True
+        backend.owned_pid = child.pid
+        backend.owned_exe = info[0]
+        backend.owned_start = info[1]
+        backend.owned_signature = backend.signature
+
+    async def test_owned_release_reports_restoration_failure_but_stops_exact_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            signature = "restoration-failure-live-child"
+            executable = os.path.realpath(sys.executable)
+            environment = {
+                **fake.environment(),
+                "FAKE_HYPR_FAIL_IDENTITY": "1",
+                "HYPRLAND_INSTANCE_SIGNATURE": signature,
+                "NIGHT_LIGHT_HYPRSUNSET": executable,
+            }
+            children = []
+            with mock.patch.dict(os.environ, environment, clear=False):
+                backend = controller.Backend()
+                owned = subprocess.Popen(
+                    [executable, "-c", "import time; time.sleep(30)"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=os.environ.copy(),
+                )
+                shared = subprocess.Popen(
+                    [executable, "-c", "import time; time.sleep(30)"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=os.environ.copy(),
+                )
+                children.extend((owned, shared))
+                try:
+                    self.record_owned_child(backend, owned)
+                    backend.last_ack = {"kind": "temperature", "temperature": 4777}
+
+                    with self.assertRaisesRegex(RuntimeError, "backend command failed"):
+                        await backend.release()
+
+                    self.assertFalse(
+                        pathlib.Path(f"/proc/{owned.pid}").exists(),
+                        "failed identity restoration orphaned the owned daemon",
+                    )
+                    self.assertIsNone(shared.poll(), "a shared process was stopped")
+                finally:
+                    for child in children:
+                        if child.poll() is None:
+                            child.kill()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            child.wait(timeout=1)
+
+    async def test_owned_release_escalates_term_resistant_child_to_kill(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            ready = root / "ready"
+            term_seen = root / "term-seen"
+            signature = "term-resistant-live-child"
+            executable = os.path.realpath(sys.executable)
+            environment = {
+                "HYPRLAND_INSTANCE_SIGNATURE": signature,
+                "NIGHT_LIGHT_HYPRSUNSET": executable,
+            }
+            script = (
+                "import pathlib, signal, sys, time\n"
+                "term = pathlib.Path(sys.argv[1])\n"
+                "signal.signal(signal.SIGTERM, lambda *_: term.write_text('term'))\n"
+                "pathlib.Path(sys.argv[2]).write_text('ready')\n"
+                "while True: time.sleep(1)\n"
+            )
+            with mock.patch.dict(os.environ, environment, clear=False):
+                backend = controller.Backend()
+                child = subprocess.Popen(
+                    [executable, "-c", script, str(term_seen), str(ready)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, env=os.environ.copy(),
+                )
+                try:
+                    deadline = time.monotonic() + 1
+                    while not ready.exists() and time.monotonic() < deadline:
+                        await asyncio.sleep(0.005)
+                    self.assertTrue(ready.exists(), "fake child did not install SIGTERM handler")
+                    self.record_owned_child(backend, child)
+                    sent = []
+                    real_send_signal = controller.signal.pidfd_send_signal
+
+                    def record_signal(pidfd, sig, *args):
+                        sent.append(sig)
+                        return real_send_signal(pidfd, sig, *args)
+
+                    with mock.patch.object(backend, "probe", side_effect=RuntimeError("IPC failed")), \
+                            mock.patch.object(
+                                controller.signal, "pidfd_send_signal", side_effect=record_signal
+                            ), \
+                            mock.patch.object(controller, "PROCESS_TERMINATE_TIMEOUT", 0.05):
+                        await backend.release()
+
+                    self.assertTrue(term_seen.exists(), "SIGTERM was not delivered")
+                    self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+                    self.assertFalse(pathlib.Path(f"/proc/{child.pid}").exists())
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        child.wait(timeout=1)
+
     async def test_close_waits_for_inflight_mutation_before_cas_release(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -365,6 +491,102 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             self.assertEqual(fake.calls(), calls_at_close)
 
+    async def test_close_waits_for_blocked_launch_and_stops_owned_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            signature = "blocked-launch-regression"
+            created = threading.Event()
+            launch_gate = threading.Event()
+            child_holder = []
+            real_popen = subprocess.Popen
+            sleep_executable = os.path.realpath("/usr/bin/sleep")
+            actual = controller.Actual("identity", 6500, 100)
+            probe_calls = 0
+
+            with mock.patch.dict(os.environ, {
+                "HYPRLAND_INSTANCE_SIGNATURE": signature,
+                "NIGHT_LIGHT_HYPRSUNSET": sleep_executable,
+                "NIGHT_LIGHT_UWSM_APP": "/fake/uwsm-app",
+            }, clear=False):
+                backend = controller.Backend()
+
+                def blocked_popen(*_args, **_kwargs):
+                    # Model Popen having forked the configured daemon while the
+                    # to_thread call has not returned to initialize() yet.
+                    child = real_popen(
+                        [sleep_executable, "30"], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True, close_fds=True,
+                        env=os.environ.copy(),
+                    )
+                    child_holder.append(child)
+                    created.set()
+                    launch_gate.wait()
+                    return child
+
+                def matching_processes():
+                    if not child_holder:
+                        return []
+                    child = child_holder[0]
+                    info = backend._process_info(child.pid)
+                    return [] if info is None else [(child.pid, info[0], info[1])]
+
+                async def fake_probe(*, publish=True):
+                    nonlocal probe_calls
+                    probe_calls += 1
+                    # Startup becomes ready exactly once, allowing initialize()
+                    # to establish baseline and ownership.  The release probe
+                    # then fails, as in the reported close-during-launch race.
+                    if not created.is_set() or probe_calls != 2:
+                        raise RuntimeError("IPC unavailable")
+                    if publish:
+                        backend.actual = actual
+                    return actual
+
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = backend
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                try:
+                    with mock.patch.object(controller.subprocess, "Popen", side_effect=blocked_popen), \
+                            mock.patch.object(backend, "matching_processes", side_effect=matching_processes), \
+                            mock.patch.object(backend, "probe", side_effect=fake_probe):
+                        await daemon.dispatch(RecordingClient(), {
+                            "protocol": 1, "requestId": "launch", "generation": 1,
+                            "operation": "setDesired", "desired": {"kind": "identity"},
+                            "intent": "schedule",
+                        })
+
+                        await asyncio.wait_for(asyncio.to_thread(created.wait), 1)
+                        child = child_holder[0]
+                        self.assertIsNone(child.poll())
+                        self.assertFalse(daemon.apply_idle.is_set())
+
+                        closing = asyncio.create_task(daemon.close())
+                        await asyncio.sleep(0.03)
+                        self.assertFalse(
+                            closing.done(),
+                            "close passed release before launch ownership was recorded",
+                        )
+                        self.assertIsNone(child.poll())
+
+                        launch_gate.set()
+                        await asyncio.wait_for(closing, 2)
+
+                    self.assertTrue(backend.started)
+                    self.assertEqual(backend.owned_pid, child.pid)
+                    self.assertGreaterEqual(probe_calls, 3, "release failure path was not exercised")
+                    child.wait(timeout=1)
+                    self.assertIsNotNone(child.returncode, "owned launch survived close")
+                finally:
+                    launch_gate.set()
+                    if not daemon.apply_task.done():
+                        daemon.apply_task.cancel()
+                        await asyncio.gather(daemon.apply_task, return_exceptions=True)
+                    for child in child_holder:
+                        if child.poll() is None:
+                            child.terminate()
+                            child.wait(timeout=1)
+
 
 class RecordingClient:
     def __init__(self):
@@ -380,6 +602,7 @@ class SlowBackend:
     def __init__(self):
         self.actual = controller.Actual("identity", 6500, 100)
         self.last_ack = None
+        self.last_attempt = None
         self.applied = []
 
     async def initialize(self):
@@ -392,11 +615,39 @@ class SlowBackend:
         self.actual = controller.Actual(desired["kind"], desired.get("temperature", 6500), 100)
         return self.actual
 
-    async def probe(self):
+    async def probe(self, *, publish=True):
         return self.actual
+
+    async def probe_reconciled(self, accept):
+        actual = await self.probe(publish=False)
+        if not accept():
+            return None
+        attempt = self.last_attempt
+        self.last_attempt = None
+        owned = actual.matches(self.last_ack)
+        if attempt is not None and actual.matches(attempt):
+            self.last_ack = attempt
+            owned = True
+        self.actual = actual
+        return actual, owned
 
     async def release(self):
         pass
+
+
+class BlockedProbeBackend(SlowBackend):
+    def __init__(self):
+        super().__init__()
+        self.probe_entered = asyncio.Event()
+        self.probe_gate = asyncio.Event()
+        self.probed_actual = controller.Actual("temperature", 4100, 100)
+
+    async def probe(self, *, publish=True):
+        self.probe_entered.set()
+        await self.probe_gate.wait()
+        if publish:
+            self.actual = self.probed_actual
+        return self.probed_actual
 
 
 class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
@@ -587,6 +838,195 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 daemon.apply_task.cancel()
                 await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_hot_reload_after_apply_gives_replacement_probe_fresh_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            daemon.backend = SlowBackend()
+            daemon.backend_ready = True
+            old_client = RecordingClient()
+            fresh_client = RecordingClient()
+            daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+            try:
+                await daemon.dispatch(old_client, {
+                    "protocol": 1, "requestId": "old-apply", "generation": 50,
+                    "operation": "setDesired",
+                    "desired": {"kind": "temperature", "temperature": 4100},
+                    "intent": "schedule",
+                })
+                await self.wait_until(lambda: any(
+                    message.get("requestId") == "old-apply"
+                    and message.get("type") == "backendStatus"
+                    for message in old_client.messages
+                ))
+                old_token = daemon.apply_token
+                self.assertIsNotNone(old_token)
+                self.assertFalse(old_token.is_set())
+
+                # This is the replacement service's exact ready -> startup-probe
+                # handshake.  A completed predecessor apply must not lend its
+                # now-cancelled token to the fresh observational request.
+                await daemon.dispatch(fresh_client, {
+                    "protocol": 1, "requestId": "fresh-probe", "generation": 0,
+                    "operation": "probe",
+                })
+
+                self.assertTrue(old_token.is_set())
+                self.assertIsNone(daemon.apply_token)
+                responses = [
+                    message for message in fresh_client.messages
+                    if message.get("requestId") == "fresh-probe"
+                ]
+                self.assertEqual(len(responses), 1)
+                self.assertEqual(responses[0]["type"], "backendStatus")
+                self.assertEqual(responses[0]["actual"]["temperature"], 4100)
+
+                await daemon.dispatch(old_client, {
+                    "protocol": 1, "requestId": "old-late", "generation": 51,
+                    "operation": "probe",
+                })
+                self.assertEqual(old_client.messages[-1]["requestId"], "old-late")
+                self.assertEqual(old_client.messages[-1]["code"], "stale-generation")
+            finally:
+                daemon.apply_task.cancel()
+                await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_blocked_old_probe_cannot_clear_replacement_pending_or_token(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            daemon.backend = BlockedProbeBackend()
+            daemon.backend_ready = True
+            old_client = RecordingClient()
+            fresh_client = RecordingClient()
+
+            old_probe = asyncio.create_task(daemon.dispatch(old_client, {
+                "protocol": 1, "requestId": "old-probe", "generation": 50,
+                "operation": "probe",
+            }))
+            await asyncio.wait_for(daemon.backend.probe_entered.wait(), 1)
+
+            # Activation and admission happen while the predecessor's probe is
+            # blocked.  The replacement owns both the pending work and token.
+            await daemon.dispatch(fresh_client, {
+                "protocol": 1, "requestId": "fresh-zero", "generation": 0,
+                "operation": "setDesired",
+                "desired": {"kind": "temperature", "temperature": 4300},
+                "intent": "schedule",
+            })
+            fresh_token = daemon.apply_token
+            self.assertIsNotNone(fresh_token)
+            self.assertIsNotNone(daemon.pending)
+            self.assertIs(daemon.pending[3], fresh_token)
+
+            daemon.backend.probe_gate.set()
+            await asyncio.wait_for(old_probe, 1)
+
+            # The obsolete observation is a complete no-op: it publishes
+            # neither backend cache/override nor cancellation state.
+            self.assertEqual(daemon.backend.actual.kind, "identity")
+            self.assertIsNone(daemon.runtime_override)
+            self.assertIsNotNone(daemon.pending)
+            self.assertIs(daemon.pending[3], fresh_token)
+            self.assertFalse(fresh_token.is_set())
+            self.assertEqual(len(old_client.messages), 1)
+            self.assertEqual(old_client.messages[0]["requestId"], "old-probe")
+            self.assertEqual(old_client.messages[0]["code"], "stale-generation")
+
+            daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+            try:
+                await self.wait_until(
+                    lambda: daemon.backend.last_ack
+                    == {"kind": "temperature", "temperature": 4300}
+                )
+                self.assertFalse(fresh_token.is_set())
+                self.assertTrue(any(
+                    message.get("requestId") == "fresh-zero"
+                    and message.get("type") == "backendStatus"
+                    for message in fresh_client.messages
+                ))
+            finally:
+                daemon.apply_task.cancel()
+                await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_hot_reload_after_write_before_ack_reconciles_fresh_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            verification_entered = root / "verification-entered"
+            verification_gate = root / "verification-gate"
+            environment = {
+                **fake.environment(),
+                "FAKE_HYPR_BLOCK_VERIFICATION": str(verification_entered),
+                "FAKE_HYPR_VERIFICATION_GATE": str(verification_gate),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend.baseline = await daemon.backend.probe()
+                daemon.backend_ready = True
+                old_client = RecordingClient()
+                fresh_client = RecordingClient()
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                try:
+                    desired = {"kind": "temperature", "temperature": 4100}
+                    await daemon.dispatch(old_client, {
+                        "protocol": 1, "requestId": "old-write", "generation": 50,
+                        "operation": "setDesired", "desired": desired,
+                        "intent": "schedule",
+                    })
+                    await self.wait_until(verification_entered.exists)
+
+                    # The mutation child has exited after changing Hyprland, but
+                    # its verification is still blocked and cannot acknowledge it.
+                    self.assertEqual(fake.writes(), [
+                        ["hyprsunset", "temperature", "4100"]
+                    ])
+                    self.assertEqual(
+                        json.loads(fake.state.read_text())["temperature"], 4100
+                    )
+                    self.assertEqual(daemon.backend.last_attempt, desired)
+                    self.assertIsNone(daemon.backend.last_ack)
+                    old_token = daemon.apply_token
+
+                    # Activation cancels the predecessor while the fresh startup
+                    # probe queues behind verification on the backend lock.
+                    fresh_probe = asyncio.create_task(daemon.dispatch(fresh_client, {
+                        "protocol": 1, "requestId": "fresh-probe", "generation": 0,
+                        "operation": "probe",
+                    }))
+                    await self.wait_until(lambda: old_token is not None and old_token.is_set())
+                    verification_gate.write_text("continue")
+                    await asyncio.wait_for(fresh_probe, 2)
+
+                    responses = [
+                        message for message in fresh_client.messages
+                        if message.get("requestId") == "fresh-probe"
+                    ]
+                    self.assertEqual(len(responses), 1)
+                    self.assertEqual(responses[0]["type"], "backendStatus")
+                    self.assertEqual(responses[0]["actual"]["temperature"], 4100)
+                    self.assertIsNone(responses[0]["override"])
+                    self.assertIsNone(daemon.runtime_override)
+                    self.assertIsNone(daemon.backend.last_attempt)
+                    self.assertEqual(daemon.backend.last_ack, desired)
+                    self.assertFalse(any(
+                        message.get("requestId") == "old-write"
+                        for message in old_client.messages
+                    ))
+
+                    # Reconciliation preserves value-CAS ownership but does not
+                    # authorize restoration over a later external winner.
+                    fake.state.write_text(json.dumps({
+                        "identity": False, "temperature": 3333, "gamma": 100,
+                    }))
+                    writes_before_release = list(fake.writes())
+                    await daemon.backend.release()
+                    self.assertEqual(
+                        json.loads(fake.state.read_text())["temperature"], 3333
+                    )
+                    self.assertEqual(fake.writes(), writes_before_release)
+                finally:
+                    daemon.apply_task.cancel()
+                    await asyncio.gather(daemon.apply_task, return_exceptions=True)
 
     async def test_hot_reload_terminates_paused_old_child_without_write_or_publication(self):
         with tempfile.TemporaryDirectory() as temporary:

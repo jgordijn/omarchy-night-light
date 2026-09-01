@@ -11,6 +11,10 @@ var TRANSITION_INTERVAL_MS = 5000
 var DAY_MS = 86400000
 var MAX_EPOCH_MS = 8640000000000000
 var MAX_EVENT_SEARCH_CYCLES = 370
+// A schedule needs only the adjacent sunset/sunrise pair.  Keep a small
+// compatibility allowance for providers that return nearby daily cycles, but
+// never iterate an untrusted JavaScript array length.
+var MAX_EVENT_COLLECTION_LENGTH = 8
 // Match SolarModel's closed input interval without expanding the frozen API
 // merely to export implementation limits.  Solar events may extend beyond
 // this interval (while remaining valid Date epochs), but every scheduled wake
@@ -31,8 +35,37 @@ if (typeof require === "function") {
   }
 }
 
+function isArray(value) {
+  try {
+    return Array.isArray(value)
+  } catch (error) {
+    // Revoked proxies and other hostile host objects are not accepted arrays.
+    return false
+  }
+}
+
 function isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
+  return value !== null && typeof value === "object" && !isArray(value)
+}
+
+// Never let a caller's prototype participate in a public input transaction.
+// Reading the descriptor also avoids invoking accessor properties while
+// retaining support for ordinary and null-prototype objects in Node and QML.
+function ownDataDescriptor(object, name) {
+  if (!isPlainObject(object) && !isArray(object)) return null
+  try {
+    var descriptor = Object.getOwnPropertyDescriptor(object, name)
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value"))
+      return null
+    return descriptor
+  } catch (error) {
+    return null
+  }
+}
+
+function ownValue(object, name) {
+  var descriptor = ownDataDescriptor(object, name)
+  return descriptor ? descriptor.value : undefined
 }
 
 function finiteNumber(value) {
@@ -63,9 +96,12 @@ function validateSettings(raw) {
   if (raw === undefined) raw = {}
   if (!isPlainObject(raw)) return settingsError("settings must be an object")
 
-  var automationEnabled = raw.automationEnabled === undefined ? true : raw.automationEnabled
-  var nightTemperature = raw.nightTemperature === undefined ? DEFAULT_NIGHT_TEMPERATURE : raw.nightTemperature
-  var transitionMinutes = raw.transitionMinutes === undefined ? DEFAULT_TRANSITION_MINUTES : raw.transitionMinutes
+  var suppliedAutomation = ownValue(raw, "automationEnabled")
+  var suppliedTemperature = ownValue(raw, "nightTemperature")
+  var suppliedTransition = ownValue(raw, "transitionMinutes")
+  var automationEnabled = suppliedAutomation === undefined ? true : suppliedAutomation
+  var nightTemperature = suppliedTemperature === undefined ? DEFAULT_NIGHT_TEMPERATURE : suppliedTemperature
+  var transitionMinutes = suppliedTransition === undefined ? DEFAULT_TRANSITION_MINUTES : suppliedTransition
 
   if (typeof automationEnabled !== "boolean")
     return settingsError("automationEnabled must be a boolean")
@@ -90,10 +126,18 @@ function settingsError(message) {
 
 function normalizedSettings(settings) {
   // Accept validateSettings(raw) as a convenience without weakening strict
-  // validation of the actual transaction.
-  if (isPlainObject(settings) && settings.ok === true) {
-    if (isPlainObject(settings.value)) settings = settings.value
-    else if (isPlainObject(settings.settings)) settings = settings.settings
+  // validation of the actual transaction.  A transaction marker itself must
+  // be own and complete; inherited or malformed wrappers are never unwrapped.
+  if (isPlainObject(settings)) {
+    var transactionOk = ownValue(settings, "ok")
+    if (transactionOk !== undefined) {
+      if (transactionOk !== true) return settingsError("settings transaction is invalid")
+      var value = ownValue(settings, "value")
+      if (isPlainObject(value)) return validateSettings(value)
+      value = ownValue(settings, "settings")
+      if (isPlainObject(value)) return validateSettings(value)
+      return settingsError("settings transaction is incomplete")
+    }
   }
   return validateSettings(settings)
 }
@@ -101,7 +145,7 @@ function normalizedSettings(settings) {
 function propertyNumber(object, names) {
   if (!isPlainObject(object)) return null
   for (var i = 0; i < names.length; i++) {
-    var value = object[names[i]]
+    var value = ownValue(object, names[i])
     if (validEpoch(value)) return value
   }
   return null
@@ -109,13 +153,12 @@ function propertyNumber(object, names) {
 
 function eventStatus(events) {
   if (!isPlainObject(events)) return ""
-  var value = events.status
-  if (value === undefined) value = events.phase
-  if (value === undefined) value = events.kind
-  value = String(value === undefined || value === null ? "" : value).toLowerCase()
-  if (value === "polar_day") value = "polar-day"
-  if (value === "polar_night") value = "polar-night"
-  return value
+  var value = ownValue(events, "status")
+  if (value === undefined) value = ownValue(events, "phase")
+  if (value === undefined) value = ownValue(events, "kind")
+  if (value === "polar_day") return "polar-day"
+  if (value === "polar_night") return "polar-night"
+  return typeof value === "string" ? value : (value === undefined ? "" : "invalid")
 }
 
 function looksLikeEvents(value) {
@@ -135,8 +178,8 @@ function solarNamespace() {
 
 function coordinatesFrom(location) {
   if (!isPlainObject(location)) return null
-  var latitude = location.latitude
-  var longitude = location.longitude
+  var latitude = ownValue(location, "latitude")
+  var longitude = ownValue(location, "longitude")
   if (!finiteNumber(latitude) || !finiteNumber(longitude)) return null
   if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null
   return { latitude: latitude, longitude: longitude }
@@ -144,8 +187,10 @@ function coordinatesFrom(location) {
 
 function resolveEvents(epochMs, location) {
   if (looksLikeEvents(location)) return location
-  if (isPlainObject(location) && looksLikeEvents(location.events)) return location.events
-  if (isPlainObject(location) && looksLikeEvents(location.solarEvents)) return location.solarEvents
+  var nestedEvents = ownValue(location, "events")
+  if (looksLikeEvents(nestedEvents)) return nestedEvents
+  nestedEvents = ownValue(location, "solarEvents")
+  if (looksLikeEvents(nestedEvents)) return nestedEvents
 
   var coordinates = coordinatesFrom(location)
   if (!coordinates) return null
@@ -172,19 +217,35 @@ function collectNumbers(object, names, output) {
 }
 
 function collectNestedCycles(events, sunsets, sunrises) {
-  var collections = [events.cycles, events.events]
-  for (var c = 0; c < collections.length; c++) {
-    if (!Array.isArray(collections[c])) continue
-    for (var i = 0; i < collections[c].length; i++) {
-      var item = collections[c][i]
-      if (!isPlainObject(item)) continue
+  var collectionNames = ["cycles", "events"]
+  for (var c = 0; c < collectionNames.length; c++) {
+    var collection = ownValue(events, collectionNames[c])
+    if (collection === undefined) continue
+    if (!isArray(collection)) return false
+
+    // Array length is a non-accessor own data property on genuine arrays.  Use
+    // its descriptor so a proxy cannot make the loop condition invoke a getter
+    // repeatedly, and reject oversized arrays before touching any index.
+    var lengthDescriptor = ownDataDescriptor(collection, "length")
+    var length = lengthDescriptor ? lengthDescriptor.value : -1
+    if (!finiteNumber(length) || Math.floor(length) !== length || length < 0 ||
+        length > MAX_EVENT_COLLECTION_LENGTH) return false
+
+    // Accepted collections are dense arrays of event objects.  Holes and
+    // accessor-backed indices are malformed, rather than work proportional to
+    // an attacker-selected sparse length or a source of caller code execution.
+    for (var i = 0; i < length; i++) {
+      var itemDescriptor = ownDataDescriptor(collection, String(i))
+      var item = itemDescriptor ? itemDescriptor.value : null
+      if (!isPlainObject(item)) return false
       collectNumbers(item, ["sunsetMs", "sunset", "setMs"], sunsets)
       collectNumbers(item, ["sunriseMs", "sunrise", "riseMs"], sunrises)
     }
   }
+  return true
 }
 
-function normalNight(events, epochMs) {
+function normalNight(events, epochMs, sunsets, sunrises) {
   var directSunset = propertyNumber(events,
     ["sunsetMs", "precedingSunsetMs", "previousSunsetMs", "sunset", "setMs"])
   var directSunrise = propertyNumber(events,
@@ -192,11 +253,8 @@ function normalNight(events, epochMs) {
   if (directSunset !== null && directSunrise !== null && directSunset < directSunrise)
     return { sunsetMs: directSunset, sunriseMs: directSunrise }
 
-  var sunsets = []
-  var sunrises = []
   collectNumbers(events, ["sunsetMs", "precedingSunsetMs", "previousSunsetMs", "nextSunsetMs", "sunset", "setMs"], sunsets)
   collectNumbers(events, ["sunriseMs", "followingSunriseMs", "previousSunriseMs", "nextSunriseMs", "sunrise", "riseMs"], sunrises)
-  collectNestedCycles(events, sunsets, sunrises)
   sunsets.sort(function(a, b) { return a - b })
   sunrises.sort(function(a, b) { return a - b })
 
@@ -322,20 +380,26 @@ function polarResult(epochMs, status, events, settings) {
     [isDay ? "nextSunsetMs" : "precedingSunsetMs", "sunsetMs", "previousSunsetMs"])
   var sunriseMs = propertyNumber(events,
     [isDay ? "previousSunriseMs" : "nextSunriseMs", "sunriseMs", "followingSunriseMs"])
-  var nextEvent = isPlainObject(events.nextEvent) ? events.nextEvent : null
-  var previousEvent = isPlainObject(events.previousEvent) ? events.previousEvent : null
-  if (nextEvent && validEpoch(nextEvent.epochMs)) {
-    if (nextEvent.kind === "sunset" && sunsetMs === null) sunsetMs = nextEvent.epochMs
-    if (nextEvent.kind === "sunrise" && sunriseMs === null) sunriseMs = nextEvent.epochMs
+  var candidate = ownValue(events, "nextEvent")
+  var nextEvent = isPlainObject(candidate) ? candidate : null
+  candidate = ownValue(events, "previousEvent")
+  var previousEvent = isPlainObject(candidate) ? candidate : null
+  var nextEventEpoch = nextEvent ? ownValue(nextEvent, "epochMs") : undefined
+  var nextEventKind = nextEvent ? ownValue(nextEvent, "kind") : undefined
+  var previousEventEpoch = previousEvent ? ownValue(previousEvent, "epochMs") : undefined
+  var previousEventKind = previousEvent ? ownValue(previousEvent, "kind") : undefined
+  if (validEpoch(nextEventEpoch)) {
+    if (nextEventKind === "sunset" && sunsetMs === null) sunsetMs = nextEventEpoch
+    if (nextEventKind === "sunrise" && sunriseMs === null) sunriseMs = nextEventEpoch
   }
-  if (previousEvent && validEpoch(previousEvent.epochMs)) {
-    if (previousEvent.kind === "sunset" && sunsetMs === null) sunsetMs = previousEvent.epochMs
-    if (previousEvent.kind === "sunrise" && sunriseMs === null) sunriseMs = previousEvent.epochMs
+  if (validEpoch(previousEventEpoch)) {
+    if (previousEventKind === "sunset" && sunsetMs === null) sunsetMs = previousEventEpoch
+    if (previousEventKind === "sunrise" && sunriseMs === null) sunriseMs = previousEventEpoch
   }
 
   var nextBoundaryMs = isDay ? sunsetMs : sunriseMs
-  if (!(nextBoundaryMs > epochMs) && nextEvent && validEpoch(nextEvent.epochMs))
-    nextBoundaryMs = nextEvent.epochMs
+  if (!(nextBoundaryMs > epochMs) && validEpoch(nextEventEpoch))
+    nextBoundaryMs = nextEventEpoch
   if (!(nextBoundaryMs > epochMs)) nextBoundaryMs = 0
 
   // Polar night has no synthetic cycle endpoints, but SolarModel retains the
@@ -393,8 +457,17 @@ function evaluate(epochMs, location, settings) {
     return errorResult(epochMs, "settings-invalid", validation.error.message)
   var normalized = validation.value
   var events = resolveEvents(epochMs, location)
-  if (!isPlainObject(events) || events.ok === false)
+  var eventsOk = ownValue(events, "ok")
+  if (!isPlainObject(events) || (eventsOk !== undefined && eventsOk !== true))
     return errorResult(epochMs, "calculation-failed", "solar events are unavailable")
+
+  // Validate optional collections at the public boundary even when direct or
+  // polar fields are sufficient.  No accepted snapshot carries an unbounded,
+  // sparse, accessor-backed, or merely array-like event collection.
+  var nestedSunsets = []
+  var nestedSunrises = []
+  if (!collectNestedCycles(events, nestedSunsets, nestedSunrises))
+    return errorResult(epochMs, "calculation-failed", "invalid solar event collection")
 
   var status = eventStatus(events)
   if (status === "polar-day" || status === "polar-night")
@@ -402,7 +475,7 @@ function evaluate(epochMs, location, settings) {
   if (status !== "" && status !== "normal")
     return errorResult(epochMs, "calculation-failed", "invalid solar event status")
 
-  var night = normalNight(events, epochMs)
+  var night = normalNight(events, epochMs, nestedSunsets, nestedSunrises)
   if (!night || !validEpoch(night.sunsetMs) || !validEpoch(night.sunriseMs) || night.sunriseMs <= night.sunsetMs)
     return errorResult(epochMs, "calculation-failed", "invalid solar event chronology")
 

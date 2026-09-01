@@ -495,6 +495,10 @@ Item {
   function _handleLocationState(message, pending) {
     _stateBusy = false
     if (pending && pending.operation === "readLocationState") {
+      if (pending.context && pending.context.conflictResolution) {
+        _handleConflictRead(message, pending)
+        return
+      }
       _privateRead = _privateReadResult(message)
       _stateReady = true
       _maybeInitialize()
@@ -527,24 +531,11 @@ Item {
     _privateRead = { outcome: "valid", ok: true, state: parsed.state, error: null }
     _pendingWeatherPersistence = null
     _stateError = null
-    // Serialize private transactions in QML as well as in the daemon.  A fast
-    // A→B edit cannot make B use A's now-obsolete expected revision, and A is
-    // never installed as the active schedule while B is waiting.
-    if (_queuedStateWrite) {
-      var queued = _queuedStateWrite
-      _queuedStateWrite = null
-      // A Weather watcher event captured under Weather mode cannot overtake a
-      // user transaction that has just selected another source.
-      if (!(queued.reason === "weather-refresh" && parsed.state.mode !== "weather")) {
-        queued.candidate.revision = parsed.state.revision
-        _stateBusy = true
-        _send("writeLocationState", { state: queued.candidate, expectedRevision: parsed.state.revision },
-              "state", { reason: queued.reason, preview: queued.preview, after: queued.after,
-                candidate: _clone(queued.candidate), expectedRevision: parsed.state.revision,
-                weatherPersistence: queued.reason === "weather-refresh" && queued.candidate.mode === "weather" })
-        return
-      }
-    }
+    // Serialize private transactions in QML as well as in the daemon. A fast
+    // A→B edit cannot make B use A's now-obsolete expected revision. Ordinary
+    // completion never installs A while B waits; conflict recovery may retain
+    // an already-valid Weather schedule until authoritative state is read.
+    if (_drainQueuedStateWrite(parsed.state, parsed.state.mode)) return
     if (pending.context && pending.context.after === "auto-locate") {
       _initializationComplete = true
       _requestAutoLocation(true)
@@ -591,7 +582,31 @@ Item {
       _networkError = _error(code === "rate-limited" ? "rate-limited" : "offline", String(message.message || "Location provider is unavailable."))
     } else if (pending && (pending.operation === "writeLocationState" || pending.operation === "forgetLocationState" || pending.operation === "readLocationState")) {
       _stateBusy = false
-      if (pending.operation === "writeLocationState" && _installWeatherAfterPersistenceFailure(pending)) return
+      if (pending.operation === "writeLocationState") {
+        if (code === "revision-conflict") {
+          _resolveRevisionConflict(pending, message)
+          return
+        }
+        // Failure does not make A current. Give the one-slot latest-wins queue
+        // the same immediate drain as success, before A can publish an error
+        // or a useful Weather preview.
+        var failedContext = pending.context || {}
+        var failedBase = _privateState
+        if (!failedBase && _privateRead && _privateRead.ok) failedBase = _privateRead.state
+        if (!failedBase && Number(failedContext.expectedRevision) === 0) failedBase = {
+          schemaVersion: 1, revision: 0, mode: "none", autoConsentVersion: 0,
+          manual: null, weatherCache: null, autoIpCache: null
+        }
+        var failedMode = failedContext.candidate ? failedContext.candidate.mode
+          : (failedBase ? failedBase.mode : "none")
+        if (_drainQueuedStateWrite(failedBase, failedMode)) return
+        if (_installWeatherAfterPersistenceFailure(pending)) return
+      }
+      if (pending.operation === "readLocationState" && pending.context && pending.context.conflictResolution) {
+        _retainConflictedIntent(pending.context.intent,
+          String(message.message || "Location state could not be read."))
+        return
+      }
       _stateError = _error(code, String(message.message || "Location state could not be updated."))
       _finishInitialization(pending.operation !== "readLocationState")
     } else {
@@ -599,6 +614,183 @@ Item {
       _backendError = _error(code === "apply-failed" ? "apply-failed" : "backend-unavailable",
                             String(message.message || "Night Light backend is unavailable."))
     }
+  }
+
+  function _stateIntentFromContext(context) {
+    context = context || {}
+    return { candidate: _clone(context.candidate), preview: context.preview,
+             reason: context.reason, after: context.after || "",
+             conflictRetries: Number(context.conflictRetries || 0) }
+  }
+
+  function _beginConflictRead(intent) {
+    if (!intent || !intent.candidate) return false
+    // Every intent receives at most one authoritative read plus one rebased
+    // CAS attempt. A later user intent gets its own bounded attempt, but a hot
+    // external writer can never make one intent spin forever.
+    intent.conflictRetries = 1
+    _stateError = null
+    _stateBusy = true
+    _send("readLocationState", {}, "state", { conflictResolution: true, intent: intent })
+    return true
+  }
+
+  function _retainConflictedIntent(intent, message) {
+    // An interaction made during recovery supersedes the failed in-flight
+    // intent. Keep whichever is newest for explicit Refresh recovery instead
+    // of acknowledging it and silently throwing it away.
+    var retained = _queuedStateWrite || intent
+    _queuedStateWrite = retained || null
+    var detail = String(message || "Location changed again.")
+    if (detail.toLowerCase().indexOf("refresh") < 0)
+      detail += " Refresh to retry your latest location change."
+    _stateError = _error("revision-conflict", detail)
+    _finishInitialization(true)
+  }
+
+  function _resolveRevisionConflict(pending, message) {
+    var context = pending.context || {}
+    var attempts = Number(context.conflictRetries || 0)
+    if (attempts >= 1) {
+      var newer = _queuedStateWrite
+      _queuedStateWrite = null
+      // The retry exhausted B's budget, not C's. Re-read for a C that arrived
+      // while B was in flight; if C also conflicts it will be retained below.
+      if (newer) {
+        if (_beginConflictRead(newer)) return
+        _retainConflictedIntent(newer, "The latest location change could not be retried.")
+        return
+      }
+      _retainConflictedIntent(_stateIntentFromContext(context),
+        String(message.message || "Location changed again. Refresh to retry your latest location change."))
+      return
+    }
+
+    // Keep only the newest local intent. The failed write is still the intent
+    // when nothing newer was queued while it was in flight.
+    var intent = _queuedStateWrite
+    _queuedStateWrite = null
+    if (!intent) intent = _stateIntentFromContext(context)
+
+    // A startup Weather cache write is ancillary to an already valid schedule.
+    // Publish that validated in-memory schedule while the authoritative state
+    // read and bounded retry are in flight rather than falling back to setup.
+    var preview = context.preview
+    if (context.weatherPersistence === true && preview && preview.ok && !preview.setup &&
+        preview.state && preview.state.mode === "weather" && preview.location &&
+        preview.location.source === "weather") {
+      _stateError = null
+      _installCommittedState(preview.state, preview)
+    }
+
+    if (!_beginConflictRead(intent))
+      _retainConflictedIntent(intent, "The latest location change could not be retried.")
+  }
+
+  function _handleConflictRead(message, pending) {
+    var read = _privateReadResult(message)
+    if (!read.ok || !read.state) {
+      _retainConflictedIntent(pending.context && pending.context.intent,
+        read.error ? read.error.message : "Location state changed and could not be read. Refresh to retry your latest location change.")
+      return
+    }
+
+    var authoritative = read.state
+    _privateRead = read
+    _privateState = authoritative
+    _stateReady = true
+    _pendingWeatherPersistence = null
+    _stateError = null
+    // The external winner is committed and therefore safe to operate while a
+    // rebased local intent is retried. For Weather, _previewState deliberately
+    // continues to prefer the current in-memory Weather observation.
+    _installCommittedState(authoritative, null)
+
+    // An edit made during the conflict read supersedes the intent that caused
+    // the conflict, preserving the service's one-slot latest-wins contract.
+    var intent = _queuedStateWrite || (pending.context && pending.context.intent)
+    _queuedStateWrite = null
+    if (!intent) return
+    var retry = _sendRebasedStateIntent(intent, authoritative)
+    if (retry.superseded) return
+    if (!retry.ok)
+      _retainConflictedIntent(intent, retry.error ? retry.error.message :
+        "Location intent could not be rebased. Refresh to retry your latest location change.")
+  }
+
+  function _rebaseStateIntent(intent, authoritative) {
+    if (!intent || !intent.candidate)
+      return { ok: false, error: _error("state-malformed", "Location intent is missing.") }
+    var source = intent.candidate
+    var candidate = _clone(authoritative)
+    var reason = String(intent.reason || "")
+    if (reason === "startup" || reason === "weather-refresh") {
+      // Cache maintenance must not undo an external source selection.
+      if (authoritative.mode !== "weather") return { ok: false, superseded: true }
+      candidate.weatherCache = _clone(source.weatherCache)
+    } else if (reason === "manual") {
+      candidate.mode = "manual"
+      candidate.manual = _clone(source.manual)
+    } else if (reason === "weather") {
+      candidate.mode = "weather"
+      candidate.weatherCache = _clone(source.weatherCache)
+    } else if (reason === "auto-consent") {
+      candidate.autoConsentVersion = source.autoConsentVersion
+    } else if (reason === "auto-accept") {
+      candidate.mode = "auto-ip"
+      candidate.autoConsentVersion = source.autoConsentVersion
+      candidate.autoIpCache = _clone(source.autoIpCache)
+    } else {
+      return { ok: false, error: _error("state-malformed", "Location intent is unsupported.") }
+    }
+    candidate.revision = authoritative.revision
+    var parsed = LocationModel.parsePrivateState(candidate)
+    if (!parsed.ok) return { ok: false, error: parsed.error }
+    var preview = _previewState(parsed.state)
+    if (!preview.ok) return { ok: false, error: preview.error }
+    return { ok: true, candidate: parsed.state, preview: preview }
+  }
+
+  function _sendRebasedStateIntent(intent, authoritative) {
+    var rebased = _rebaseStateIntent(intent, authoritative)
+    if (!rebased.ok) return rebased
+    var revision = Number(authoritative.revision)
+    _stateBusy = true
+    _send("writeLocationState", { state: rebased.candidate, expectedRevision: revision }, "state",
+          { reason: intent.reason, preview: rebased.preview, after: intent.after || "",
+            candidate: _clone(rebased.candidate), expectedRevision: revision,
+            conflictRetries: Number(intent.conflictRetries || 0),
+            weatherPersistence: (intent.reason === "startup" || intent.reason === "weather-refresh") &&
+              rebased.candidate.mode === "weather" })
+    return { ok: true }
+  }
+
+  function _drainQueuedStateWrite(authoritative, precedingMode) {
+    if (!_queuedStateWrite) return false
+    var queued = _queuedStateWrite
+    _queuedStateWrite = null
+    // A Weather watcher event captured under Weather mode cannot overtake a
+    // user transaction that has just selected another source, including when
+    // that user transaction itself failed to persist.
+    if (queued.reason === "weather-refresh" && precedingMode !== "weather") return false
+    if (!authoritative) {
+      _queuedStateWrite = queued
+      _stateError = _error("state-malformed", "Location intent could not be rebased onto known state.")
+      _finishInitialization(true)
+      return true
+    }
+    // The queued object is only an intent snapshot. Always reconstruct its
+    // candidate and preview from the latest canonical state: on success this
+    // is predecessor A's committed result, while on failure it is the state
+    // that preceded A.
+    var sent = _sendRebasedStateIntent(queued, authoritative)
+    if (sent.superseded) return false
+    if (!sent.ok) {
+      _queuedStateWrite = queued
+      _stateError = sent.error || _error("state-malformed", "Location intent could not be rebased.")
+      _finishInitialization(true)
+    }
+    return true
   }
 
   function _installWeatherAfterPersistenceFailure(pending) {
@@ -687,15 +879,19 @@ Item {
     _actionError = null
     if (_stateBusy) {
       _queuedStateWrite = { candidate: _clone(candidate), preview: preview,
-                            reason: reason, after: after || "" }
+                            reason: reason, after: after || "", conflictRetries: 0 }
       return true
     }
+    // A fresh interaction supersedes an older terminally conflicted intent.
+    // That retained slot is otherwise retried only by explicit Refresh.
+    _queuedStateWrite = null
     _stateBusy = true
     var weatherPersistence = (reason === "startup" || reason === "weather-refresh") &&
       candidate && candidate.mode === "weather"
     _send("writeLocationState", { state: candidate, expectedRevision: expectedRevision }, "state",
           { reason: reason, preview: preview, after: after || "", candidate: _clone(candidate),
-            expectedRevision: expectedRevision, weatherPersistence: weatherPersistence })
+            expectedRevision: expectedRevision, conflictRetries: 0,
+            weatherPersistence: weatherPersistence })
     return true
   }
 
@@ -894,11 +1090,20 @@ Item {
   }
 
   function refresh() {
-    // A failed Weather-cache transaction is nonblocking, but refresh is also
-    // its explicit retry path. Recompute/probe remain observational.
-    _retryWeatherPersistence()
+    // Failed private transactions are nonblocking, but Refresh is their
+    // explicit, user-bounded recovery path. Recompute/probe remain observational.
+    if (!_retryConflictedStateWrite()) _retryWeatherPersistence()
     _evaluateSchedule(false, false, true)
     _probeBackend(false)
+    return true
+  }
+
+  function _retryConflictedStateWrite() {
+    if (_stateBusy || !_queuedStateWrite) return false
+    var intent = _queuedStateWrite
+    _queuedStateWrite = null
+    if (_beginConflictRead(intent)) return true
+    _retainConflictedIntent(intent, "The latest location change could not be retried.")
     return true
   }
 
