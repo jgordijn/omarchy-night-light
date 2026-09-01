@@ -205,8 +205,8 @@ Panel {
     if (calculationError) return "The last display setting was left unchanged."
     if (overridden) {
       var resumeAt = projectedDisplayTime("overrideUntil") || projectedDisplayTime("nextBoundary")
-      var boundaryName = (phase === "night" || phase === "morning-transition" || phase === "polar-night") ? "sunrise" : "sunset"
-      return "Automatic resumes at " + boundaryName + " · " + formatProjectedTime(resumeAt)
+      return "Automatic resumes at " + projectedBoundaryName(resumeAt) + " · " +
+        formatProjectedTime(resumeAt)
     }
     if (locationStateError) return errorState && errorState.message ? String(errorState.message) : "The saved location could not be read."
     if (runtimeMode === "setup") return "Needed only to calculate sunrise and sunset."
@@ -271,6 +271,16 @@ Panel {
     if (projected.ambiguous === true)
       text += " · " + projectedOffsetText(projected.offsetMinutes)
     return text
+  }
+
+  function projectedBoundaryName(projected) {
+    var epoch = projected ? Number(projected.epochMs) : NaN
+    var sunrise = projectedDisplayTime("sunrise")
+    var sunset = projectedDisplayTime("sunset")
+    if (isFinite(epoch) && sunrise && Number(sunrise.epochMs) === epoch) return "sunrise"
+    if (isFinite(epoch) && sunset && Number(sunset.epochMs) === epoch) return "sunset"
+    return (phase === "night" || phase === "morning-transition" || phase === "polar-night")
+      ? "sunrise" : "sunset"
   }
 
   function ageText(observedAt) {

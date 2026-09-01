@@ -424,6 +424,21 @@ ShellRoot {
         equal(nightPanel.stateDetail, "Sunset at —",
               "missing projection never falls back to the stable epoch in the shell timezone")
         fakeService.timeline = projectedFixture
+        var projectedOverride = JSON.parse(JSON.stringify(projectedFixture))
+        projectedOverride.displayTimes.nextBoundary = projectedOverride.displayTimes.sunrise
+        projectedOverride.displayTimes.overrideUntil = projectedOverride.displayTimes.sunrise
+        fakeService.timeline = projectedOverride
+        fakeService.mode = "override"
+        fakeService.phase = "evening-transition"
+        fakeService.overrideUntil = fakeService.sunrise
+        equal(nightPanel.stateDetail,
+              "Automatic resumes at sunrise · " +
+                nightPanel.formatProjectedTime(projectedOverride.displayTimes.sunrise),
+              "override boundary name follows the projected event, not the transition phase")
+        fakeService.timeline = projectedFixture
+        fakeService.mode = "scheduled"
+        fakeService.phase = "day"
+        fakeService.overrideUntil = 0
         equal(nightPanel.focusIndex, 1, "Automatic is the initial normal focus")
         check(nightPanel.keyboardPanel.owner === widget, "KeyboardPanel owner is host widget")
         check(nightPanel.keyboardPanel.anchorItem !== null, "actual WidgetButton is the anchor")

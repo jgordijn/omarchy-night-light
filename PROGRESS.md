@@ -1,59 +1,72 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 16:56 CEST_
+_Last updated: 2026-09-01 20:53 CEST_
 
 ## Status
 
-**Wave 3 specification frozen; production implementation has not started.**
+**Wave 3 is implemented. Final coherence edit is complete and awaiting the final commit/update/restart proof.**
 
-The Git-managed source checkout and installed clone were independently inspected alongside the installed `/usr/share/omarchy/shell/plugins/panels/clock`. The live service reported a scheduled daytime target with an available backend, no error, and Weather as the active source. Runtime inspection showed one session daemon, one QML attachment, one shared `hyprsunset`, private `0600` state/socket files in `0700` directories, and no plugin-attributable QML warning or coredump.
+The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-light` was the source under review. It is enabled beside installed Clock and, before this edit, was at `2b7a66a` with a clean tree. Current production includes the civil timeline, lunar model/renderer, projected event labels, and persisted-first live Warmth transaction.
 
-## Final fix
+## Proven coherence fix
 
-Actual keyboard exercise exposed a contract conflict: stock `PanelKeyCatcher` consumes `l` as Right before Night Light can use its documented Location shortcut. This also caused an unnecessary inline settings write. Normal mode now uses a direct, conflict-free focus owner: `l` opens Location and Left/Right alone adjust values. The accidental no-op settings key from each live reproduction was removed again; saved location, stock-indicator metadata, and display target were retained.
+Fresh installed exercise exposed one cross-piece copy defect while an override was active during `evening-transition`: the projected resume time was the next sunrise, but `Panel.qml` inferred the event name from the transition phase and rendered `Automatic resumes at sunset · 6:53 AM`.
 
-The QML harness now invokes the real normal-key handler and asserts that `l` is consumed by the Location editor. Source-contract coverage prevents reintroducing `PanelKeyCatcher` or `l` as normal-mode Right. README and SPEC keyboard copy now agree with runtime behavior. SPEC was also reconciled with the fitted editor geometry, bounded apply retry sequence, and actual tracked test inventory.
+`Panel.qml` now derives the boundary name from the same atomic projected event epochs used for the displayed time. `test/qml-entrypoints-test.sh` reproduces an evening-transition override whose projected boundary is sunrise and requires the coherent sunrise label. No timeline, schedule, backend, location, indicator, or settings behavior changed.
 
-## Verification
+The complete controller suite also exposed a pre-existing nondeterministic test-harness race: the gated writer made the successor row observable immediately before `broadcast_status()` resumed from `drain()` and consumed its matching private ack allowance. The assertion still requires consumption, but now waits for that lifecycle boundary. The focused race passed 20 consecutive runs; no controller production code changed.
 
-All repository suites pass on the final working tree:
+## Installed UI evidence
+
+Fresh installed captures are under `.work/screens/final-coherence/` in the canonical checkout:
+
+- `01-installed-rest.png`: fixed 520 × 440 dashboard, arrows hidden at rest, current nighttime waning-gibbous marker rendered on the rail.
+- `02-installed-rail-hover.png` and `03-installed-sunrise-hover.png`: real installed pointer placement evidence. The current Hyprland 0.56 Lua cursor warp moved the visible pointer but did not synthesize a client hover event; therefore these two fresh images are not claimed as successful hover activation. The already-installed same-source proof at `.work/screens/w3-installed/sunrise-hover.png` remains the actual successful native-delay hover evidence.
+- `04-installed-keyboard-timeline.png` through `07-installed-keyboard-unpin.png`: actual Up-to-Timeline focus, Left/Right selection, Sunrise pin, Sunset transfer, and unpin.
+- `08-installed-escape-close.png`: immediate close.
+- `09-installed-tab-handoff.png` and `10-installed-shifttab-return.png`: neighboring Tailscale handoff and return.
+- `13-clock-night-light-side-by-side.png`: fresh same-theme, same-scale installed Clock/Night Light comparison.
+
+The actual pinned labels were `Sunrise 6:51 AM` and `Sunset 8:30 PM`, matching current-day projected civil events. The hero’s `6:53 AM` is tomorrow’s projected sunrise and is intentionally a different event.
+
+All three supplied references were used. Fresh timeline, dark-moon, and light-moon harness captures each compare at RMSE `0 (0)` to their frozen reference image. The moon harness also passed its area-fidelity matrix.
+
+## Warmth and safety evidence
+
+Live Warmth semantics were exercised only through isolated fake shell/controller/backend suites: full night, both transitions, day, paused, override, unavailable/unprobed, rapid steps, failure/recovery, external CAS, and hot reload all passed. No real Warmth row control was activated. Shell settings, private Night Light state, and Weather hashes stayed byte-identical through installed timeline interaction:
+
+- shell: `610a5386cfa879abeb38bc64d72d05d3ad861d49d3643ded8d1ff47637d4c86c`
+- Night Light state: `de79831674d32575f75ec991529b9dd564e382800707eceb2ddf526ba519a537`
+- Weather state: `afe41450766855e1877c5538a8d4a7c66077e76297b28d047559acca643582ba`
+
+One early backend inspection used the obsolete `hyprctl hyprsunset identity get` form under Hyprland 0.56; it briefly selected identity rather than reading it. Automatic scheduling was restored immediately through the public `resume` API. The saved `2250 K` preference, location, and indicators never changed, and final status returned to scheduled `evening-transition`. This is recorded explicitly rather than claimed as a no-display-write proof.
+
+## Automated verification
+
+Final complete run from the installed tree:
 
 - Solar: 16/16
 - Schedule: 26/26
 - Location: 68/68
-- Controller: 27/27
-- Manifest/Omarchy validation: PASS
+- Timeline model: 19/19
+- Moon model: 10/10
+- Controller: 42/42
+- Manifest: PASS
 - Source contract: PASS
 - QML entry points: PASS (`dashboard=440`, `location=375`, `manual=223`)
 - QML service: PASS
 - QML service conflict/CAS: PASS
+- QML timeline service: PASS
+- QML timeline UI: PASS
+- QML moon icon: PASS
+- QML live Warmth: PASS
+- Omarchy plugin validation: PASS
+- `git diff --check`: PASS
 
-Live screenshots exercised the installed dashboard, Clock, Escape close, and Tab handoff to the adjacent Tailscale panel. A real pointer hover over the Night Light bar item showed native hand-cursor affordance. Same-scale Clock and Night Light captures were also placed in a randomized A/B composite at `.work/screens/final/blind-ab.png`.
+The complete output is `.work/final-coherence/all-suites-final.log`. Shell logs contain expected local-plugin reloads and unrelated isolated-harness XKB warnings; no Night Light timeline/moon QML warning, plugin error, or new coredump was observed.
 
-After `omarchy plugin update jgordijn.night-light --yes`, the shell was restarted so the keyboard proof used a newly instantiated installed panel rather than the already-running pre-update QML object. The installed `l` shortcut then opened Location (`.work/screens/final-installed-restarted/screenshot-2026-09-01_15-41-02.png`); Escape returned to the dashboard. Shell settings and private state hashes were identical before and after that proof, and Kelvin/identity remained `6500 K`/`true`.
+## Remaining finalization
 
-## Wave 3 fan-out
-
-`WAVE3-SPEC.md` integrates all four Wave 3 research reports, the three World Clock references, fresh installed Night Light/Clock output, installed shell primitives, current production code, controller protocol, and test harnesses. Contradictions are resolved into one normative build order while `SPEC.md` remains authoritative for every guarantee not explicitly superseded.
-
-| Piece | Status |
-|---|---|
-| Timeline/product/lunar/preview research | Complete |
-| Wave 3 integration contract | **Frozen — `WAVE3-SPEC.md`** |
-| `TimelineModel.js` | Ready to build; not started |
-| `MoonModel.js` | Ready to build; not started |
-| Civil timezone projection and atomic Service timeline | Ready to build; not started |
-| Moon primitive and timeline QML components | Ready to build; not started |
-| Panel timeline/focus integration | Ready to build; not started |
-| Persisted-first Warmth and external-change CAS | Ready to build; not started |
-| Installed-output and five-reviewer blind loop | Blocked on implementation |
-
-No production or test file was changed during specification work.
-
-## Previous independent blind gate
-
-A separate fresh-context critic inspected and used the real Git-managed installed plugin—not a builder summary—and randomized Night Light/Clock ordering across normal, editor, focus, and handoff captures. It explicitly judged **Night Light better overall**, scoring **4.89 vs Clock’s 4.77**, and returned **UTTERLY WOWED/PASS**. Evidence and detailed scoring are in `.work/reports/final-independent-critic.md` and `.work/screens/final-independent-critic/`.
-
-Every independently reviewed piece now has a WOW/PASS result: pure models, controller lifecycle, QML service/state races, native UI, packaging/update path, and final installed integration. The broader SPEC five-human-reviewer study remains a future release exercise rather than a claim made here.
-
-The live exercise did not forget location or change Kelvin (`6500 K` before and after). It did not alter the existing hidden-stock restoration transaction or disable `omarchy.nightlight`.
+1. Commit this coherence edit in the installed Git checkout.
+2. Run `omarchy plugin update jgordijn.night-light --yes`.
+3. Restart the shell, verify installed HEAD/status/processes/status/hashes, and capture the corrected installed override copy with a fake-only harness (real display remains scheduled).

@@ -934,6 +934,13 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(wire[1]["actual"], {
                         "kind": "temperature", "temperature": 4100, "gamma": 100,
                     })
+                    # writer.write() makes the second row observable before
+                    # broadcast_status() resumes from drain and consumes the
+                    # matching private ack allowance. Wait for that lifecycle
+                    # boundary rather than racing it.
+                    await self.wait_until(
+                        lambda: not daemon.backend.last_ack_chain_available
+                    )
                     self.assertFalse(daemon.backend.last_ack_chain_available)
                 finally:
                     writer.drain_gate.set()
