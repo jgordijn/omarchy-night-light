@@ -4,9 +4,9 @@ _Last updated: 2026-09-01 20:53 CEST_
 
 ## Status
 
-**Wave 3 is implemented. Final coherence edit is complete and awaiting the final commit/update/restart proof.**
+**Wave 3 is implemented. The final coherence source edit is committed, updated, restarted, and verified from the installed checkout.**
 
-The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-light` was the source under review. It is enabled beside installed Clock and, before this edit, was at `2b7a66a` with a clean tree. Current production includes the civil timeline, lunar model/renderer, projected event labels, and persisted-first live Warmth transaction.
+The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-light` was the source under review. It is enabled beside installed Clock and, before this edit, was at `2b7a66a` with a clean tree. The source fix is commit `f52a780` (`Keep override boundary labels coherent`). Current production includes the civil timeline, lunar model/renderer, projected event labels, and persisted-first live Warmth transaction.
 
 ## Proven coherence fix
 
@@ -26,6 +26,7 @@ Fresh installed captures are under `.work/screens/final-coherence/` in the canon
 - `08-installed-escape-close.png`: immediate close.
 - `09-installed-tab-handoff.png` and `10-installed-shifttab-return.png`: neighboring Tailscale handoff and return.
 - `13-clock-night-light-side-by-side.png`: fresh same-theme, same-scale installed Clock/Night Light comparison.
+- `14-post-update-rest.png` through `16-post-update-escape.png`: newly instantiated post-update/post-restart rest, keyboard pin, and immediate-close proof.
 
 The actual pinned labels were `Sunrise 6:51 AM` and `Sunset 8:30 PM`, matching current-day projected civil events. The hero’s `6:53 AM` is tomorrow’s projected sunrise and is intentionally a different event.
 
@@ -63,10 +64,14 @@ Final complete run from the installed tree:
 - Omarchy plugin validation: PASS
 - `git diff --check`: PASS
 
-The complete output is `.work/final-coherence/all-suites-final.log`. Shell logs contain expected local-plugin reloads and unrelated isolated-harness XKB warnings; no Night Light timeline/moon QML warning, plugin error, or new coredump was observed.
+The complete output is `.work/final-coherence/all-suites-final.log`. Shell logs contain expected local-plugin reloads and unrelated isolated-harness XKB warnings; no Night Light timeline/moon QML warning or plugin error was observed.
 
-## Remaining finalization
+## Update/restart and crash record
 
-1. Commit this coherence edit in the installed Git checkout.
-2. Run `omarchy plugin update jgordijn.night-light --yes`.
-3. Restart the shell, verify installed HEAD/status/processes/status/hashes, and capture the corrected installed override copy with a fake-only harness (real display remains scheduled).
+`omarchy plugin update jgordijn.night-light --yes` completed with installed HEAD `f52a780`, then `omarchy restart shell` instantiated the committed panel. Final runtime returned to one controller daemon, one attachment, one shared `hyprsunset`, private `0700`/`0600` runtime paths, scheduled `evening-transition`, and no status error. Post-restart timeline interaction again left all three safety hashes unchanged.
+
+The requested shell restart did produce a new Quickshell 0.3.1 SIGSEGV (`PID 690387`). It occurred only after `Exiting due to IPC request`; the core/report show all IPC handlers being deregistered, then a main-thread `__dynamic_cast` failure under `QQmlObjectCreator::finalize`/`QQmlComponent::createObject`. Memory was not exhausted, the shell supervisor relaunched successfully, and neither the core nor log names Night Light code. This supports a Quickshell shutdown/object-finalization race, not a proven plugin defect, but it is a real new coredump and is not hidden behind a PASS claim. Core diagnosis was read-only and the extracted temporary core was deleted.
+
+## Final state
+
+Source behavior and all automated suites pass, and installed timeline/lunar/keyboard/Clock evidence is present. The successful old-style pointer hover capture is real installed evidence, but a fresh Hyprland 0.56 programmatic warp did not synthesize hover; no fresh hover PASS is claimed. The Quickshell restart crash is also an explicit unresolved environment/runtime caveat rather than a plugin PASS.
