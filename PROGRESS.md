@@ -1,6 +1,6 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 21:25 CEST_
+_Last updated: 2026-09-01 21:35 CEST_
 
 ## Status
 
@@ -13,6 +13,8 @@ The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-l
 Commit `9890105` anchors the popup to the actual Night Light bar button instead of centering it on the screen. The installed `KeyboardPanel` now performs its native top/bottom/left/right placement and screen-edge clamping. The small painted focus boxes around selected sunrise/sunset arrows are gone; their 32-unit hit areas, bold/color selection cue, accessibility action, hover, and pin behavior remain, as does the larger timeline-row keyboard focus cue.
 
 The installed plugin was updated and the shell restarted to instantiate the new placement. Real installed screenshots are `.work/screens/remarks-installed-restarted.png` and `.work/screens/remarks-installed-restarted-arrow.png`. The latter shows the card directly beneath the top-right Night Light icon with no small arrow box. Settings/state hashes remained unchanged, runtime stayed scheduled and healthy, and this restart produced no coredump. Independent review: **WOW/PASS** in `.work/reports/remarks-critic.md`.
+
+Commit `8d5545a` removes the non-interactive outlined source tag. Location provenance now follows the location name as quiet italic copy, for example `Hilversumse Meent  via Weather`. The actual installed result is `.work/screens/inline-location-source-installed.png`; all suites pass and the instantiating restart produced no coredump.
 
 ## Proven coherence fix
 
