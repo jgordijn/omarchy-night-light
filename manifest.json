@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "jgordijn.night-light",
+  "name": "Night Light",
+  "version": "1.0.0",
+  "author": "Jeroen Gordijn",
+  "description": "Offline solar night light with a native Omarchy panel",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Night Light",
+    "description": "Warm the display from sunset to sunrise",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

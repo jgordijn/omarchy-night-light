@@ -1,0 +1,1605 @@
+#!/usr/bin/env python3
+"""Session controller for jgordijn.night-light.
+
+The public interface is the ``attach`` subcommand.  It is a newline-delimited
+JSON proxy to one compositor-session daemon.  This module deliberately uses
+only the Python standard library and never invokes a shell.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import datetime as dt
+import errno
+import fcntl
+import hashlib
+import http.client
+import json
+import math
+import os
+import pathlib
+import re
+import signal
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable
+
+PROTOCOL = 1
+VERSION = "1.0.0"
+MAX_LINE = 64 * 1024
+MAX_BODY = 256 * 1024
+RELEASE_GRACE = float(os.environ.get("NIGHT_LIGHT_RELEASE_GRACE", "8"))
+TEMPERATURE_WRITE_INTERVAL = 5.0
+# One accepted write can spend two seconds in hyprctl and six more verifying
+# identity, temperature, and gamma.  Shutdown lets that transaction become
+# truthful before falling back to terminating its child.
+SHUTDOWN_APPLY_TIMEOUT = 9.0
+PROCESS_TERMINATE_TIMEOUT = 0.25
+PROCESS_KILL_TIMEOUT = 1.0
+ALLOWED_HOSTS = frozenset(("geocoding-api.open-meteo.com", "wttr.in"))
+LOCATION_KEYS = (
+    "label", "admin1", "country", "latitude", "longitude", "timezone",
+    "source", "precision", "observedAt",
+)
+SOURCE_PRECISION = {
+    "weather": "selected-locality",
+    "manual-search": "selected-locality",
+    "manual-coordinates": "coordinates",
+    "auto-ip": "approximate-city",
+}
+# Linux sockaddr_un.sun_path has 108 bytes, including the terminating NUL for
+# pathname sockets.  Keep this explicit: pathlib character counts are not the
+# bound enforced by AF_UNIX.
+UNIX_SOCKET_PATH_BYTES = 107
+
+
+def _open_directory(path: pathlib.Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def _private_dir(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = _open_directory(path)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("private path is not a directory")
+        if info.st_uid != os.getuid():
+            raise PermissionError("private path has a different owner")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _safe_signature(value: str) -> str:
+    """Return a fixed-size, filesystem-safe encoding of a session identity."""
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _require_private_runtime_root(path: pathlib.Path) -> None:
+    if not path.is_absolute():
+        raise RuntimeError("XDG_RUNTIME_DIR must be absolute")
+    try:
+        fd = _open_directory(path)
+    except OSError as exc:
+        raise RuntimeError("XDG_RUNTIME_DIR is not an accessible directory") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError("XDG_RUNTIME_DIR has an invalid owner or type")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise RuntimeError("XDG_RUNTIME_DIR is not private")
+    finally:
+        os.close(fd)
+
+
+def _require_unix_path(path: pathlib.Path) -> None:
+    encoded = os.fsencode(path)
+    if b"\0" in encoded or len(encoded) > UNIX_SOCKET_PATH_BYTES:
+        raise RuntimeError("controller socket path exceeds the AF_UNIX byte limit")
+
+
+def runtime_dir() -> pathlib.Path:
+    root = os.environ.get("XDG_RUNTIME_DIR")
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not root or not signature:
+        raise RuntimeError("XDG_RUNTIME_DIR and HYPRLAND_INSTANCE_SIGNATURE are required")
+    runtime_root = pathlib.Path(root)
+    _require_private_runtime_root(runtime_root)
+    base = runtime_root / "jgordijn-night-light"
+    result = base / _safe_signature(signature)
+    # Validate before creating anything.  Hashing the complete signature keeps
+    # the component at 43 ASCII bytes without conflating compositor sessions.
+    _require_unix_path(result / "control.sock")
+    _private_dir(base)
+    _private_dir(result)
+    return result
+
+
+def location_path() -> pathlib.Path:
+    override = os.environ.get("NIGHT_LIGHT_STATE_PATH")
+    if override:
+        return pathlib.Path(override)
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if not state_home:
+        home = os.environ.get("HOME")
+        if not home:
+            raise RuntimeError("HOME is required")
+        state_home = str(pathlib.Path(home) / ".local" / "state")
+    return pathlib.Path(state_home) / "omarchy" / "settings" / "jgordijn.night-light.json"
+
+
+def _limited_string(value: Any, limit: int, *, nonempty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid location text")
+    value = value.strip()
+    if nonempty and not value:
+        raise ValueError("empty location label")
+    if len(value) > limit:
+        raise ValueError("location text is too long")
+    return value
+
+
+def _coordinate(value: Any, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("invalid coordinate")
+    result = float(value)
+    if not math.isfinite(result) or result < low or result > high:
+        raise ValueError("coordinate out of range")
+    # Keep integers/numbers as JSON numbers, while normalizing negative zero.
+    return 0.0 if result == 0 else result
+
+
+def _timestamp(value: Any) -> str:
+    value = _limited_string(value, 64, nonempty=True)
+    if not value.endswith("Z"):
+        raise ValueError("timestamp is not UTC")
+    try:
+        parsed = dt.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError("invalid timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise ValueError("timestamp is not UTC")
+    return value
+
+
+def validate_location(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("location must be an object")
+    source = value.get("source")
+    if source not in SOURCE_PRECISION or value.get("precision") != SOURCE_PRECISION[source]:
+        raise ValueError("invalid source and precision")
+    return {
+        "label": _limited_string(value.get("label"), 120, nonempty=True),
+        "admin1": _limited_string(value.get("admin1"), 80),
+        "country": _limited_string(value.get("country"), 80),
+        "latitude": _coordinate(value.get("latitude"), -90, 90),
+        "longitude": _coordinate(value.get("longitude"), -180, 180),
+        "timezone": _limited_string(value.get("timezone"), 80),
+        "source": source,
+        "precision": value["precision"],
+        "observedAt": _timestamp(value.get("observedAt")),
+    }
+
+
+def validate_state(value: Any, *, revision: int | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("state must be an object")
+    if value.get("schemaVersion") != 1:
+        raise ValueError("unsupported schema")
+    raw_revision = value.get("revision") if revision is None else revision
+    if isinstance(raw_revision, bool) or not isinstance(raw_revision, int) or raw_revision < 0:
+        raise ValueError("invalid revision")
+    mode = value.get("mode")
+    if mode not in ("none", "weather", "manual", "auto-ip"):
+        raise ValueError("invalid mode")
+    consent = value.get("autoConsentVersion")
+    if isinstance(consent, bool) or not isinstance(consent, int) or consent not in (0, 1):
+        raise ValueError("invalid consent version")
+    manual = validate_location(value.get("manual"))
+    weather = validate_location(value.get("weatherCache"))
+    auto_ip = validate_location(value.get("autoIpCache"))
+    if manual is not None and manual["source"] not in ("manual-search", "manual-coordinates"):
+        raise ValueError("invalid manual location")
+    if weather is not None and weather["source"] != "weather":
+        raise ValueError("invalid weather cache")
+    if auto_ip is not None and auto_ip["source"] != "auto-ip":
+        raise ValueError("invalid automatic cache")
+    if mode == "manual" and manual is None:
+        raise ValueError("manual mode has no location")
+    if mode == "auto-ip" and (auto_ip is None or consent != 1):
+        raise ValueError("automatic mode has no consented location")
+    return {
+        "schemaVersion": 1,
+        "revision": raw_revision,
+        "mode": mode,
+        "autoConsentVersion": consent,
+        "manual": manual,
+        "weatherCache": weather,
+        "autoIpCache": auto_ip,
+    }
+
+
+class LocationStore:
+    """Atomic, private state storage with revision compare-and-swap."""
+
+    def __init__(self, path: pathlib.Path | None = None):
+        self.path = path or location_path()
+        self._lock = threading.RLock()
+
+    def read(self) -> tuple[str, dict[str, Any] | None]:
+        with self._lock:
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> tuple[str, dict[str, Any] | None]:
+        try:
+            info = self.path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                return "temporarily-unavailable", None
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return "absent", None
+        except OSError:
+            return "temporarily-unavailable", None
+        try:
+            decoded = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "malformed", None
+        if isinstance(decoded, dict) and decoded.get("schemaVersion") != 1:
+            return "unsupported-schema", None
+        try:
+            return "valid", validate_state(decoded)
+        except ValueError:
+            return "malformed", None
+
+    def write(self, candidate: Any, expected_revision: int | None = None) -> dict[str, Any]:
+        with self._lock:
+            outcome, current = self._read_unlocked()
+            if outcome not in ("absent", "valid"):
+                raise StateError("state-not-writable", outcome)
+            current_revision = current["revision"] if current is not None else 0
+            if expected_revision is not None:
+                if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                    raise StateError("revision-conflict", "invalid expected revision")
+                if expected_revision != current_revision:
+                    raise StateError("revision-conflict", "location state changed")
+            try:
+                state = validate_state(candidate, revision=current_revision + 1)
+            except ValueError as exc:
+                raise StateError("state-invalid", str(exc)) from exc
+            parent = self.path.parent
+            _private_dir(parent)
+            payload = (json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+            temporary: pathlib.Path | None = None
+            try:
+                fd, name = tempfile.mkstemp(prefix="." + self.path.name + ".", dir=parent)
+                temporary = pathlib.Path(name)
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "wb", closefd=True) as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+                temporary = None
+                os.chmod(self.path, 0o600)
+                directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError as exc:
+                raise StateError("state-write-failed", "could not save location state") from exc
+            finally:
+                if temporary is not None:
+                    with contextlib.suppress(FileNotFoundError):
+                        temporary.unlink()
+            return state
+
+    def forget(self, expected_revision: int | None = None) -> None:
+        with self._lock:
+            outcome, current = self._read_unlocked()
+            current_revision = current["revision"] if outcome == "valid" and current else 0
+            if expected_revision is not None and expected_revision != current_revision:
+                raise StateError("revision-conflict", "location state changed")
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise StateError("state-delete-failed", "could not forget location state") from exc
+            directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+
+class StateError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class NetworkError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class ProviderClient:
+    def __init__(self, request_json: Callable[..., Any] | None = None):
+        self._request = request_json or self._request_json
+
+    @staticmethod
+    def _request_json(host: str, path: str, *, deadline: float) -> Any:
+        if host not in ALLOWED_HOSTS or not path.startswith("/") or path.startswith("//"):
+            raise NetworkError("network-denied", "provider is not allowed")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise NetworkError("offline", "provider request timed out")
+        connection = http.client.HTTPSConnection(
+            host, 443, timeout=min(3.0, remaining), context=ssl.create_default_context()
+        )
+        try:
+            connection.request("GET", path, headers={"User-Agent": f"jgordijn.night-light/{VERSION}", "Accept": "application/json"})
+            response = connection.getresponse()
+            if response.status == 429:
+                raise NetworkError("rate-limited", "provider rate limited the request")
+            if response.status < 200 or response.status >= 300:
+                raise NetworkError("offline", "provider request failed")
+            body = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise NetworkError("offline", "provider request timed out")
+                if connection.sock is not None:
+                    connection.sock.settimeout(min(3.0, remaining))
+                chunk = response.read(min(65536, MAX_BODY + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > MAX_BODY:
+                    raise NetworkError("response-too-large", "provider response was too large")
+            try:
+                return json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise NetworkError("provider-invalid", "provider returned invalid data") from exc
+        except NetworkError:
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            raise NetworkError("offline", "provider is unavailable") from exc
+        finally:
+            connection.close()
+
+    def _with_rate_retry(self, host: str, path: str) -> Any:
+        deadline = time.monotonic() + 6.0
+        for attempt, delay in enumerate((0.0, 0.25, 1.0)):
+            if delay:
+                if time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
+            try:
+                return self._request(host, path, deadline=deadline)
+            except NetworkError as exc:
+                if exc.code != "rate-limited" or attempt == 2:
+                    raise
+        raise NetworkError("rate-limited", "provider rate limited the request")
+
+    def geocode(self, query: Any, language: Any) -> list[dict[str, Any]]:
+        if not isinstance(query, str):
+            raise NetworkError("invalid-request", "invalid search query")
+        normalized = " ".join(query.split())
+        if len(normalized) > 200 or len("".join(normalized.split())) < 3:
+            raise NetworkError("invalid-request", "search query is too short")
+        if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?", language):
+            language = "en"
+        path = "/v1/search?" + urllib.parse.urlencode({
+            "name": normalized, "count": 5, "format": "json", "language": language,
+        })
+        data = self._with_rate_retry("geocoding-api.open-meteo.com", path)
+        if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+            raise NetworkError("provider-invalid", "provider returned invalid data")
+        results = []
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        for item in data.get("results", [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                location = validate_location({
+                    "label": item.get("name", ""),
+                    "admin1": item.get("admin1", ""),
+                    "country": item.get("country", ""),
+                    "latitude": item.get("latitude"),
+                    "longitude": item.get("longitude"),
+                    "timezone": item.get("timezone", ""),
+                    "source": "manual-search",
+                    "precision": "selected-locality",
+                    "observedAt": now,
+                })
+            except ValueError:
+                continue
+            if location is not None:
+                results.append(location)
+        return results
+
+    @staticmethod
+    def _wttr_value(area: dict[str, Any], key: str) -> str:
+        value = area.get(key, "")
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            value = value[0].get("value", "")
+        return value if isinstance(value, str) else ""
+
+    def auto_locate(self) -> dict[str, Any]:
+        data = self._with_rate_retry("wttr.in", "/?format=j1")
+        try:
+            area = data["nearest_area"][0]
+            latitude = area["latitude"]
+            longitude = area["longitude"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise NetworkError("provider-invalid", "provider returned invalid data") from exc
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        try:
+            location = validate_location({
+                "label": self._wttr_value(area, "areaName") or "Approximate",
+                "admin1": self._wttr_value(area, "region"),
+                "country": self._wttr_value(area, "country"),
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "timezone": "",
+                "source": "auto-ip",
+                "precision": "approximate-city",
+                "observedAt": now,
+            })
+        except (ValueError, TypeError) as exc:
+            raise NetworkError("provider-invalid", "provider returned invalid data") from exc
+        assert location is not None
+        return location
+
+
+@dataclass(frozen=True)
+class Actual:
+    kind: str
+    temperature: int
+    gamma: int
+
+    def json(self) -> dict[str, Any]:
+        return {"kind": self.kind, "temperature": self.temperature, "gamma": self.gamma}
+
+    def matches(self, desired: dict[str, Any] | None) -> bool:
+        return bool(desired) and self.kind == desired["kind"] and (
+            self.kind == "identity" or self.temperature == desired["temperature"]
+        )
+
+
+def validate_desired(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict) or raw.get("kind") not in ("identity", "temperature"):
+        raise ValueError("invalid desired state")
+    if raw["kind"] == "identity":
+        return {"kind": "identity"}
+    value = raw.get("temperature")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1000 <= value <= 6500:
+        raise ValueError("invalid desired temperature")
+    return {"kind": "temperature", "temperature": value}
+
+
+class ApplySuperseded(Exception):
+    """An apply token was replaced before it could mutate the display."""
+
+
+class ApplyToken:
+    """Attachment/generation-labelled cancellation visible to loop and worker."""
+
+    def __init__(self, generation: int, attachment_epoch: int):
+        self.generation = generation
+        self.attachment_epoch = attachment_epoch
+        self._async_event = asyncio.Event()
+        self._thread_event = threading.Event()
+        self._stop_child_event = asyncio.Event()
+        self._stop_child_thread_event = threading.Event()
+
+    def set(self, *, stop_mutating_child: bool = True) -> None:
+        # Shutdown may stop admission while allowing an already-running apply
+        # transaction its bounded grace.  Supersession additionally raises the
+        # child barrier used by hot reload and latest-wins replacement.
+        if stop_mutating_child:
+            self._stop_child_thread_event.set()
+            self._stop_child_event.set()
+        self._thread_event.set()
+        self._async_event.set()
+
+    def is_set(self) -> bool:
+        return self._thread_event.is_set()
+
+    def must_stop_child(self) -> bool:
+        return self._stop_child_thread_event.is_set()
+
+    async def wait(self) -> None:
+        await self._async_event.wait()
+
+    async def wait_to_stop_child(self) -> None:
+        await self._stop_child_event.wait()
+
+
+class Backend:
+    """Serialized hyprsunset access.  Every child is invoked with argv only."""
+
+    def __init__(self):
+        self.hyprctl = os.environ.get("NIGHT_LIGHT_HYPRCTL", "/usr/bin/hyprctl")
+        self.hyprsunset = os.environ.get("NIGHT_LIGHT_HYPRSUNSET", "/usr/bin/hyprsunset")
+        self.uwsm = os.environ.get("NIGHT_LIGHT_UWSM_APP", "/usr/bin/uwsm-app")
+        self.signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        self.baseline: Actual | None = None
+        self.actual: Actual | None = None
+        self.last_ack: dict[str, Any] | None = None
+        # Kept distinct from last_ack: a timed-out child may have changed the
+        # compositor before it was terminated even though verification did not
+        # complete.  Release may CAS against either truthful possibility.
+        self.last_attempt: dict[str, Any] | None = None
+        self.last_temperature_write = 0.0
+        self.owned_pid: int | None = None
+        self.owned_start: str | None = None
+        self.owned_exe: str | None = None
+        self.started = False
+        self.command_lock = asyncio.Lock()
+        self.accepting_applies = True
+        self._mutating_processes: set[asyncio.subprocess.Process] = set()
+
+    async def _stop_process(
+        self,
+        process: asyncio.subprocess.Process,
+        communication: asyncio.Task[tuple[bytes, bytes]] | None = None,
+    ) -> None:
+        """Terminate and reap a child; returning always means it cannot write."""
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+        waiter: asyncio.Task[Any] = (
+            communication if communication is not None
+            else asyncio.create_task(process.wait())
+        )
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), PROCESS_TERMINATE_TIMEOUT)
+            return
+        except asyncio.TimeoutError:
+            pass
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), PROCESS_KILL_TIMEOUT)
+        except asyncio.TimeoutError as exc:
+            if communication is not None:
+                communication.cancel()
+            raise RuntimeError("backend command could not be stopped") from exc
+
+    async def stop_mutating_processes(self) -> None:
+        """Defensive shutdown barrier used before compare-and-swap release."""
+        processes = tuple(self._mutating_processes)
+        if processes:
+            await asyncio.gather(
+                *(self._stop_process(process) for process in processes),
+                return_exceptions=False,
+            )
+            for process in processes:
+                if process.returncode is not None:
+                    self._mutating_processes.discard(process)
+        if self._mutating_processes:
+            raise RuntimeError("backend mutation did not stop")
+
+    async def _run(
+        self,
+        argv: list[str],
+        timeout: float = 2.0,
+        *,
+        superseded: ApplyToken | None = None,
+        mutating: bool = False,
+        shutdown_write: bool = False,
+    ) -> str:
+        # Unlike asyncio.to_thread(subprocess.run), this keeps a process handle:
+        # cancellation and timeout both terminate and reap the child.
+        if superseded is not None and superseded.is_set():
+            raise ApplySuperseded()
+        if mutating and not shutdown_write and not self.accepting_applies:
+            raise ApplySuperseded()
+        creation = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+        try:
+            process = await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            # Process creation itself is cancellation-sensitive.  Recover the
+            # handle and stop it rather than letting an untracked child escape.
+            process = await creation
+            await self._stop_process(process)
+            raise
+        if mutating:
+            self._mutating_processes.add(process)
+        communication = asyncio.create_task(process.communicate())
+        superseded_wait: asyncio.Task[None] | None = None
+        if mutating and superseded is not None:
+            superseded_wait = asyncio.create_task(superseded.wait_to_stop_child())
+        try:
+            waiters: set[asyncio.Task[Any]] = {communication}
+            if superseded_wait is not None:
+                waiters.add(superseded_wait)
+            done, _pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            # Cancellation wins a simultaneous process completion.  Once the
+            # attachment handshake sets this token, return only after its old
+            # mutating child has been terminated and reaped.  command_lock then
+            # makes this a barrier before a replacement apply can start.
+            if superseded is not None and superseded.must_stop_child():
+                await self._stop_process(process, communication)
+                raise ApplySuperseded()
+            if communication not in done:
+                await self._stop_process(process, communication)
+                raise RuntimeError("backend command timed out")
+            stdout, _stderr = communication.result()
+            if process.returncode != 0:
+                raise RuntimeError("backend command failed")
+            return stdout.decode("utf-8", "replace").strip()
+        except asyncio.CancelledError:
+            await self._stop_process(process, communication)
+            raise
+        finally:
+            if superseded_wait is not None:
+                superseded_wait.cancel()
+                await asyncio.gather(superseded_wait, return_exceptions=True)
+            # Keep an unreaped child visible to the shutdown barrier.  In the
+            # exceptional case where SIGKILL cannot be observed within its
+            # bound, release must fail closed rather than claim quiescence.
+            if mutating and process.returncode is not None:
+                self._mutating_processes.discard(process)
+
+    @staticmethod
+    def _integer(output: str, low: int, high: int) -> int:
+        matches = re.findall(r"(?<![\d.])-?\d+(?![\d.])", output)
+        if not matches:
+            raise RuntimeError("malformed backend response")
+        value = int(matches[-1])
+        if not low <= value <= high:
+            raise RuntimeError("backend value out of range")
+        return value
+
+    async def _probe_locked(self) -> Actual:
+        """Probe while command_lock is held by the caller."""
+        identity_text = await self._run([self.hyprctl, "hyprsunset", "identity", "get"])
+        temperature_text = await self._run([self.hyprctl, "hyprsunset", "temperature"])
+        gamma_text = await self._run([self.hyprctl, "hyprsunset", "gamma"])
+        lowered = identity_text.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            identity = True
+        elif lowered in ("false", "0", "no", "off"):
+            identity = False
+        else:
+            raise RuntimeError("malformed identity response")
+        actual = Actual(
+            "identity" if identity else "temperature",
+            self._integer(temperature_text, 1000, 20000),
+            self._integer(gamma_text, 1, 1000),
+        )
+        self.actual = actual
+        return actual
+
+    async def probe(self) -> Actual:
+        async with self.command_lock:
+            return await self._probe_locked()
+
+    def _process_info(self, pid: int) -> tuple[str, str, str] | None:
+        proc = pathlib.Path("/proc") / str(pid)
+        try:
+            exe = os.readlink(proc / "exe")
+            environ = (proc / "environ").read_bytes().split(b"\0")
+            signature = ("HYPRLAND_INSTANCE_SIGNATURE=" + self.signature).encode()
+            if signature not in environ:
+                return None
+            fields = (proc / "stat").read_text().split()
+            return exe, fields[21], "matched"
+        except (OSError, IndexError, UnicodeDecodeError):
+            return None
+
+    def matching_processes(self) -> list[tuple[int, str, str]]:
+        expected = os.path.realpath(self.hyprsunset)
+        found = []
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return found
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                info = self._process_info(int(entry.name))
+                if info and os.path.realpath(info[0]) == expected:
+                    found.append((int(entry.name), info[0], info[1]))
+        return found
+
+    async def initialize(self) -> Actual:
+        try:
+            actual = await self.probe()
+            self.baseline = actual
+            return actual
+        except Exception:
+            pass
+        matches = self.matching_processes()
+        if matches:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                try:
+                    actual = await self.probe()
+                    self.baseline = actual
+                    return actual
+                except Exception:
+                    continue
+            raise RuntimeError("matching hyprsunset IPC did not become ready")
+        # No matching session process exists.  Launch exact configured binaries.
+        await asyncio.to_thread(
+            subprocess.Popen,
+            [self.uwsm, "--", self.hyprsunset, "--config", "/dev/null", "--identity"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+        self.started = True
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            matches = self.matching_processes()
+            if len(matches) == 1:
+                self.owned_pid, self.owned_exe, self.owned_start = matches[0]
+            try:
+                actual = await self.probe()
+                self.baseline = actual
+                return actual
+            except Exception:
+                continue
+        raise RuntimeError("hyprsunset did not start")
+
+    async def apply(
+        self,
+        desired: dict[str, Any],
+        *,
+        restoring: bool = False,
+        superseded: ApplyToken | None = None,
+    ) -> Actual:
+        desired = validate_desired(desired)
+        if superseded is not None and superseded.is_set():
+            raise ApplySuperseded()
+
+        wait = 0.0
+        if desired["kind"] == "temperature" and not restoring:
+            wait = TEMPERATURE_WRITE_INTERVAL - (time.monotonic() - self.last_temperature_write)
+        if wait > 0:
+            # Matching requests are observational and must not sit through the
+            # write limiter.  A second probe below closes changes during wait.
+            actual = await self.probe()
+            if actual.matches(desired):
+                return actual
+            if superseded is None:
+                await asyncio.sleep(wait)
+            else:
+                try:
+                    await asyncio.wait_for(superseded.wait(), timeout=wait)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    raise ApplySuperseded()
+
+        async with self.command_lock:
+            if superseded is not None and superseded.is_set():
+                raise ApplySuperseded()
+
+            # The controller, rather than any caller-side cache, is the final
+            # no-op authority.  Probe and the possible mutation share the lock
+            # so daemon work cannot interleave between that decision and write.
+            actual = await self._probe_locked()
+            if actual.matches(desired):
+                return actual
+
+            if not restoring:
+                self.last_attempt = desired
+            if desired["kind"] == "identity":
+                await self._run(
+                    [self.hyprctl, "hyprsunset", "identity", "true"],
+                    superseded=superseded, mutating=True,
+                    shutdown_write=restoring,
+                )
+            else:
+                await self._run(
+                    [self.hyprctl, "hyprsunset", "temperature", str(desired["temperature"])],
+                    superseded=superseded, mutating=True,
+                    shutdown_write=restoring,
+                )
+                self.last_temperature_write = time.monotonic()
+            if superseded is not None and superseded.is_set():
+                raise ApplySuperseded()
+            actual = await self._probe_locked()
+            # Verification can overlap an attachment handshake.  Do not turn
+            # obsolete completion into acknowledged ownership.
+            if superseded is not None and superseded.is_set():
+                raise ApplySuperseded()
+            if not actual.matches(desired):
+                raise RuntimeError("backend verification failed")
+            if not restoring:
+                self.last_ack = desired
+            return actual
+
+    def _owned_still_matches(self) -> bool:
+        if self.owned_pid is None or self.owned_start is None or self.owned_exe is None:
+            return False
+        info = self._process_info(self.owned_pid)
+        return bool(info and info[1] == self.owned_start and os.path.realpath(info[0]) == os.path.realpath(self.owned_exe))
+
+    async def release(self) -> None:
+        """Restore/stop only when actual still equals our acknowledged write."""
+        try:
+            actual = await self.probe()
+        except Exception:
+            return
+        candidates = [
+            candidate for candidate in (self.last_attempt, self.last_ack)
+            if candidate is not None
+        ]
+        if not candidates and self.started and self.baseline is not None:
+            expected = {"kind": self.baseline.kind}
+            if self.baseline.kind == "temperature":
+                expected["temperature"] = self.baseline.temperature
+            candidates.append(expected)
+        if candidates and not any(actual.matches(candidate) for candidate in candidates):
+            return  # An external owner won the CAS; do not touch it.
+        expected = candidates[0] if candidates else None
+        if self.started:
+            try:
+                await self.apply({"kind": "identity"}, restoring=True)
+            except Exception:
+                return
+            if self._owned_still_matches():
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(self.owned_pid, signal.SIGTERM)  # type: ignore[arg-type]
+            return
+        if self.baseline is not None and expected is not None:
+            target = {"kind": self.baseline.kind}
+            if self.baseline.kind == "temperature":
+                target["temperature"] = self.baseline.temperature
+            if not actual.matches(target):
+                with contextlib.suppress(Exception):
+                    await self.apply(target, restoring=True)
+
+
+class Client:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader = reader
+        self.writer = writer
+        self.write_lock = asyncio.Lock()
+        self.tasks: dict[str, asyncio.Task[Any]] = {}
+
+    async def send(
+        self,
+        value: dict[str, Any],
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> None:
+        if self.writer.is_closing():
+            return
+        data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        async with self.write_lock:
+            # Check after waiting for the output lock and immediately before
+            # publication, so an attachment epoch change cannot queue an old
+            # status behind an earlier message.
+            if guard is not None and not guard():
+                return
+            self.writer.write(data)
+            await self.writer.drain()
+
+
+@dataclass
+class AttachmentSession:
+    epoch: int
+    generation_floor: dict[str, int]
+
+
+class ControllerDaemon:
+    def __init__(self, directory: pathlib.Path):
+        self.directory = directory
+        self.socket_path = directory / "control.sock"
+        self.lock_path = directory / "controller.lock"
+        self.lock_fd: int | None = None
+        self.server: asyncio.AbstractServer | None = None
+        self.clients: set[Client] = set()
+        self.ever_attached = False
+        self.release_task: asyncio.Task[Any] | None = None
+        self.stop_event = asyncio.Event()
+        self.store = LocationStore()
+        self.provider = ProviderClient()
+        self.backend = Backend()
+        self.backend_ready = False
+        self.backend_error: str | None = None
+        self.pending: tuple[dict[str, Any], Client, dict[str, Any], ApplyToken] | None = None
+        self.deferred: tuple[dict[str, Any], Client, dict[str, Any], ApplyToken] | None = None
+        self.apply_token: ApplyToken | None = None
+        self.apply_event = asyncio.Event()
+        self.apply_task: asyncio.Task[Any] | None = None
+        self.health_task: asyncio.Task[Any] | None = None
+        self.attachment_epoch = 0
+        self.active_attachment_epoch = 0
+        self.attachment_sessions: dict[Any, AttachmentSession] = {}
+        self.network_token: dict[str, tuple[Any, ...] | None] = {"geocode": None, "auto": None}
+        self.state_transaction_lock = asyncio.Lock()
+        self.apply_idle = asyncio.Event()
+        self.apply_idle.set()
+        self.closing = False
+        self.runtime_override: dict[str, Any] | None = None
+        self.last_schedule_boundary: int | None = None
+
+    def acquire(self) -> bool:
+        flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(self.lock_path, flags, 0o600)
+        info = os.fstat(lock_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            os.close(lock_fd)
+            raise PermissionError("controller lock has an invalid owner or type")
+        os.fchmod(lock_fd, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            return False
+        self.lock_fd = lock_fd
+        return True
+
+    async def start(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            self.socket_path.unlink()
+        self.server = await asyncio.start_unix_server(self.handle_client, path=self.socket_path, limit=MAX_LINE + 1)
+        socket_info = self.socket_path.lstat()
+        if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.getuid():
+            self.server.close()
+            await self.server.wait_closed()
+            raise PermissionError("controller socket has an invalid owner or type")
+        os.chmod(self.socket_path, 0o600)
+        self.apply_task = asyncio.create_task(self.apply_loop())
+        self.health_task = asyncio.create_task(self.health_loop())
+        try:
+            await self.backend.initialize()
+            self.backend_ready = True
+        except Exception:
+            self.backend_error = "backend-unavailable"
+        # A daemon spawned by an attachment that dies before connecting must not
+        # become an orphan either.
+        if not self.clients:
+            self.release_task = asyncio.create_task(self.release_after_grace())
+
+    async def broadcast_status(
+        self,
+        request: dict[str, Any] | None = None,
+        client: Client | None = None,
+        *,
+        expected_epoch: int | None = None,
+        expected_token: ApplyToken | None = None,
+    ) -> None:
+        actual = self.backend.actual.json() if self.backend.actual else {"kind": "unavailable"}
+        response = {
+            "protocol": PROTOCOL, "type": "backendStatus", "available": self.backend_ready,
+            "actual": actual, "override": self.runtime_override, "error": self.backend_error,
+        }
+        if request:
+            response.update(request_fields(request))
+        targets = [client] if client else list(self.clients)
+        for target in targets:
+            if target is None:
+                continue
+
+            def still_current(target: Client = target) -> bool:
+                session = self.attachment_sessions.get(target)
+                if session is None or session.epoch != self.active_attachment_epoch:
+                    return False
+                if expected_epoch is not None and session.epoch != expected_epoch:
+                    return False
+                return expected_token is None or self.apply_is_current(target, expected_token)
+
+            with contextlib.suppress(Exception):
+                await target.send(response, guard=still_current)
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        sock = writer.get_extra_info("socket")
+        if sock is not None and hasattr(socket, "SO_PEERCRED"):
+            try:
+                _pid, uid, _gid = __import__("struct").unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if uid != os.getuid():
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+            except OSError:
+                writer.close()
+                return
+        client = Client(reader, writer)
+        session = self.activate_client(client)
+        self.ever_attached = True
+        if self.release_task:
+            self.release_task.cancel()
+            self.release_task = None
+        await client.send({"protocol": PROTOCOL, "type": "ready", "daemonPid": os.getpid(), "available": self.backend_ready})
+        await self.broadcast_status(client=client, expected_epoch=session.epoch)
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    break
+                if not line:
+                    break
+                if len(line) > MAX_LINE or not line.endswith(b"\n"):
+                    break
+                try:
+                    request = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    await self.error(client, {}, "invalid-json", "request is not valid JSON")
+                    continue
+                await self.dispatch(client, request)
+        finally:
+            for task in client.tasks.values():
+                task.cancel()
+            self.clients.discard(client)
+            self.attachment_sessions.pop(client, None)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            if not self.clients and self.ever_attached and not self.closing:
+                self.release_task = asyncio.create_task(self.release_after_grace())
+
+    async def release_after_grace(self) -> None:
+        try:
+            await asyncio.sleep(RELEASE_GRACE)
+            if not self.clients:
+                self.stop_event.set()
+        except asyncio.CancelledError:
+            pass
+
+    async def error(self, client: Client, request: Any, code: str, message: str) -> None:
+        response = {"protocol": PROTOCOL, "type": "error", "code": code, "message": message}
+        if isinstance(request, dict):
+            response.update(request_fields(request))
+        await client.send(response)
+
+    @staticmethod
+    def valid_request(request: Any) -> tuple[bool, str]:
+        if not isinstance(request, dict) or request.get("protocol") != PROTOCOL:
+            return False, "unsupported-protocol"
+        if not isinstance(request.get("requestId"), (str, int)) or isinstance(request.get("requestId"), bool):
+            return False, "invalid-request"
+        generation = request.get("generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            return False, "invalid-request"
+        if not isinstance(request.get("operation"), str):
+            return False, "invalid-request"
+        return True, ""
+
+    def activate_client(self, client: Any, *, connected: bool = True) -> AttachmentSession:
+        """Make a new attachment the sole publisher for a fresh generation namespace."""
+        existing = self.attachment_sessions.get(client)
+        if existing is not None:
+            return existing
+        self.attachment_epoch += 1
+        session = AttachmentSession(
+            self.attachment_epoch,
+            {"backend": -1, "state": -1, "geocode": -1, "auto": -1},
+        )
+        self.attachment_sessions[client] = session
+        self.active_attachment_epoch = session.epoch
+        if connected:
+            self.clients.add(client)
+
+        # A socket attachment is the epoch handshake.  Work from an overlapping
+        # hot-reload predecessor must neither publish nor overtake the replacement.
+        self.pending = None
+        self.deferred = None
+        if self.apply_token is not None:
+            self.apply_token.set()
+        self.network_token = {"geocode": None, "auto": None}
+        for attached in self.clients:
+            if attached is client:
+                continue
+            for task in list(attached.tasks.values()):
+                task.cancel()
+            attached.tasks.clear()
+        return session
+
+    def is_current_client(self, client: Any) -> bool:
+        session = self.attachment_sessions.get(client)
+        return bool(session and session.epoch == self.active_attachment_epoch)
+
+    def accept_generation(self, client: Any, family: str, generation: int) -> bool:
+        session = self.attachment_sessions.get(client)
+        if session is None:
+            session = self.activate_client(client)
+        if session.epoch != self.active_attachment_epoch:
+            return False
+        if generation < session.generation_floor[family]:
+            return False
+        session.generation_floor[family] = generation
+        return True
+
+    def generation_is_current(self, client: Any, family: str, generation: int) -> bool:
+        session = self.attachment_sessions.get(client)
+        return bool(
+            session
+            and session.epoch == self.active_attachment_epoch
+            and generation == session.generation_floor[family]
+        )
+
+    def apply_is_current(self, client: Any, token: ApplyToken) -> bool:
+        session = self.attachment_sessions.get(client)
+        return bool(
+            not token.is_set()
+            and session
+            and session.epoch == token.attachment_epoch == self.active_attachment_epoch
+            and session.generation_floor["backend"] == token.generation
+            and self.apply_token is token
+        )
+
+    async def dispatch(self, client: Client, request: Any) -> None:
+        valid, code = self.valid_request(request)
+        if not valid:
+            await self.error(client, request, code, "invalid controller request")
+            return
+        if client not in self.attachment_sessions:
+            # Direct dispatch is also used by deterministic unit clients which
+            # have no stream lease; real socket clients are tracked in handle_client.
+            self.activate_client(client, connected=False)
+        operation = request["operation"]
+        generation = request["generation"]
+        if not self.is_current_client(client):
+            await self.error(client, request, "stale-generation", "attachment is obsolete")
+            return
+        if operation == "probe":
+            epoch = self.attachment_sessions[client].epoch
+            try:
+                await self.observe()
+            except Exception:
+                pass
+            await self.broadcast_status(request, client, expected_epoch=epoch)
+        elif operation == "setDesired":
+            if not self.accept_generation(client, "backend", generation):
+                await self.error(client, request, "stale-generation", "request is obsolete")
+                return
+            try:
+                desired = validate_desired(request.get("desired"))
+            except ValueError as exc:
+                await self.error(client, request, "invalid-request", str(exc))
+                return
+            intent = request.get("intent")
+            if intent not in ("schedule", "override"):
+                await self.error(client, request, "invalid-request", "invalid intent")
+                return
+            until = request.get("overrideUntil")
+            if until is not None and (isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until) or until < 0):
+                await self.error(client, request, "invalid-request", "invalid override expiry")
+                return
+            if intent == "override":
+                self.runtime_override = {"target": desired, "until": until or 0, "source": "panel"}
+            else:
+                if until is not None:
+                    self.last_schedule_boundary = int(until)
+                if request.get("resume") is True or (self.runtime_override and self.runtime_override.get("until", 0) <= time.time() * 1000):
+                    self.runtime_override = None
+                if self.runtime_override:
+                    await self.broadcast_status(
+                        request, client,
+                        expected_epoch=self.attachment_sessions[client].epoch,
+                    )
+                    return
+            metadata = request_fields(request)
+            self.deferred = None
+            if self.apply_token is not None:
+                self.apply_token.set()
+            token = ApplyToken(generation, self.attachment_sessions[client].epoch)
+            self.apply_token = token
+            self.pending = (desired, client, metadata, token)
+            self.apply_event.set()
+        elif operation == "readLocationState":
+            outcome, state = await asyncio.to_thread(self.store.read)
+            await client.send({"protocol": PROTOCOL, "type": "locationState", "outcome": outcome, "state": state, **request_fields(request)})
+        elif operation == "writeLocationState":
+            if not self.accept_generation(client, "state", generation):
+                await self.error(client, request, "stale-generation", "request is obsolete")
+                return
+            try:
+                async with self.state_transaction_lock:
+                    if not self.generation_is_current(client, "state", generation):
+                        await self.error(client, request, "stale-generation", "request is obsolete")
+                        return
+                    state = await asyncio.to_thread(self.store.write, request.get("state"), request.get("expectedRevision"))
+                if self.generation_is_current(client, "state", generation):
+                    await client.send({"protocol": PROTOCOL, "type": "locationState", "outcome": "valid", "state": state, **request_fields(request)})
+            except StateError as exc:
+                await self.error(client, request, exc.code, str(exc))
+        elif operation == "forgetLocationState":
+            if not self.accept_generation(client, "state", generation):
+                await self.error(client, request, "stale-generation", "request is obsolete")
+                return
+            try:
+                async with self.state_transaction_lock:
+                    if not self.generation_is_current(client, "state", generation):
+                        await self.error(client, request, "stale-generation", "request is obsolete")
+                        return
+                    await asyncio.to_thread(self.store.forget, request.get("expectedRevision"))
+                # Forget is also an immediate privacy cancellation barrier.
+                session = self.attachment_sessions[client]
+                session.generation_floor["geocode"] = max(session.generation_floor["geocode"], generation)
+                session.generation_floor["auto"] = max(session.generation_floor["auto"], generation)
+                self.network_token = {"geocode": None, "auto": None}
+                for attached in self.clients:
+                    for task in list(attached.tasks.values()):
+                        task.cancel()
+                    attached.tasks.clear()
+                await client.send({"protocol": PROTOCOL, "type": "locationState", "outcome": "absent", "state": None, **request_fields(request)})
+            except StateError as exc:
+                await self.error(client, request, exc.code, str(exc))
+        elif operation in ("geocode", "autoLocate"):
+            family = "geocode" if operation == "geocode" else "auto"
+            if operation == "autoLocate":
+                outcome, persisted = await asyncio.to_thread(self.store.read)
+                if outcome != "valid" or persisted is None or persisted["autoConsentVersion"] != 1:
+                    await self.error(client, request, "consent-required", "approximate location requires consent")
+                    return
+            if not self.accept_generation(client, family, generation):
+                await self.error(client, request, "stale-generation", "request is obsolete")
+                return
+            epoch = self.attachment_sessions[client].epoch
+            if family == "geocode":
+                token = (epoch, generation, request.get("searchEpoch"), " ".join(str(request.get("query", "")).split()))
+            else:
+                token = (epoch, generation, request.get("locationEpoch"))
+            self.network_token[family] = token
+            request_id = str(request["requestId"])
+            old = client.tasks.pop(request_id, None)
+            if old:
+                old.cancel()
+            task = asyncio.create_task(self.network_operation(client, request, family))
+            client.tasks[request_id] = task
+        elif operation == "cancel":
+            target = str(request.get("cancelRequestId", request.get("requestId")))
+            task = client.tasks.pop(target, None)
+            if task:
+                task.cancel()
+            await client.send({"protocol": PROTOCOL, "type": "networkResult", "cancelled": True, **request_fields(request)})
+        else:
+            await self.error(client, request, "unknown-operation", "unknown controller operation")
+
+    async def network_operation(self, client: Client, request: dict[str, Any], family: str) -> None:
+        session = self.attachment_sessions.get(client)
+        if session is None:
+            return
+        if family == "geocode":
+            token = (session.epoch, request["generation"], request.get("searchEpoch"), " ".join(str(request.get("query", "")).split()))
+        else:
+            token = (session.epoch, request["generation"], request.get("locationEpoch"))
+        try:
+            if family == "geocode":
+                payload = await asyncio.to_thread(self.provider.geocode, request.get("query"), request.get("language", "en"))
+                extra = {"results": payload, "searchEpoch": request.get("searchEpoch"), "query": token[3]}
+            else:
+                payload = await asyncio.to_thread(self.provider.auto_locate)
+                extra = {"result": payload, "locationEpoch": request.get("locationEpoch")}
+            if token != self.network_token[family] or not self.is_current_client(client):
+                return
+            await client.send({"protocol": PROTOCOL, "type": "networkResult", "ok": True, **extra, **request_fields(request)})
+        except asyncio.CancelledError:
+            return
+        except NetworkError as exc:
+            if token == self.network_token[family] and self.is_current_client(client):
+                await self.error(client, request, exc.code, str(exc))
+        finally:
+            request_id = str(request["requestId"])
+            if client.tasks.get(request_id) is asyncio.current_task():
+                client.tasks.pop(request_id, None)
+
+    async def apply_loop(self) -> None:
+        while True:
+            await self.apply_event.wait()
+            self.apply_event.clear()
+            while self.pending is not None:
+                desired, client, metadata, token = self.pending
+                self.pending = None
+                if not self.backend_ready:
+                    try:
+                        await self.backend.initialize()
+                        self.backend_ready = True
+                        self.backend_error = None
+                    except Exception:
+                        if not self.apply_is_current(client, token):
+                            continue
+                        self.backend_error = "backend-unavailable"
+                        self.deferred = (desired, client, metadata, token)
+                        await self.broadcast_status(
+                            metadata, client,
+                            expected_epoch=token.attachment_epoch,
+                            expected_token=token,
+                        )
+                        break
+                if not self.apply_is_current(client, token):
+                    continue
+                success = False
+                superseded = False
+                for delay in (0.0, 0.25, 1.0):
+                    if delay:
+                        try:
+                            await asyncio.wait_for(token.wait(), timeout=delay)
+                        except asyncio.TimeoutError:
+                            pass
+                    # The immutable token closes retry, backend rate-limit, and
+                    # already-running mutating-child waits when work is replaced.
+                    if not self.apply_is_current(client, token):
+                        superseded = True
+                        break
+                    self.apply_idle.clear()
+                    try:
+                        await self.backend.apply(desired, superseded=token)
+                        if not self.apply_is_current(client, token):
+                            superseded = True
+                            break
+                        success = True
+                        self.backend_error = None
+                        break
+                    except ApplySuperseded:
+                        superseded = True
+                        break
+                    except Exception:
+                        if not self.apply_is_current(client, token):
+                            superseded = True
+                            break
+                        self.backend_error = "apply-failed"
+                    finally:
+                        self.apply_idle.set()
+                if superseded or not self.apply_is_current(client, token):
+                    continue
+                if not success:
+                    self.backend_ready = False
+                    self.deferred = (desired, client, metadata, token)
+                await self.broadcast_status(
+                    metadata, client,
+                    expected_epoch=token.attachment_epoch,
+                    expected_token=token,
+                )
+
+    async def observe(self) -> Actual:
+        previous = self.backend.actual
+        actual = await self.backend.probe()
+        self.backend_ready = True
+        self.backend_error = None
+        if previous is not None and actual != previous and not actual.matches(self.backend.last_ack):
+            self.runtime_override = {
+                "target": {"kind": actual.kind, **({"temperature": actual.temperature} if actual.kind == "temperature" else {})},
+                "until": self.last_schedule_boundary or 0,
+                "source": "external",
+            }
+            self.pending = None
+            if self.apply_token is not None:
+                self.apply_token.set()
+        return actual
+
+    async def health_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self.observe()
+                if self.deferred is not None and self.pending is None and self.runtime_override is None:
+                    self.pending = self.deferred
+                    self.deferred = None
+                    self.apply_event.set()
+            except Exception:
+                self.backend_ready = False
+                self.backend_error = "backend-unavailable"
+            await self.broadcast_status()
+
+    async def close(self) -> None:
+        # Stop admission first.  An apply already past its final token check is
+        # allowed to finish and record last_ack; only then may release perform
+        # its compare-and-swap.  If it exceeds the transaction's bound, task
+        # cancellation terminates and reaps the tracked child.
+        self.closing = True
+        self.backend.accepting_applies = False
+        self.pending = None
+        self.deferred = None
+        if self.apply_token is not None:
+            self.apply_token.set(stop_mutating_child=False)
+        if self.release_task:
+            self.release_task.cancel()
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        for client in list(self.clients):
+            client.writer.close()
+
+        if self.health_task:
+            self.health_task.cancel()
+            await asyncio.gather(self.health_task, return_exceptions=True)
+        stop_mutations = getattr(self.backend, "stop_mutating_processes", None)
+        if self.apply_task:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self.apply_idle.wait()), SHUTDOWN_APPLY_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                self.apply_task.cancel()
+            else:
+                self.apply_task.cancel()
+            if stop_mutations is not None:
+                await stop_mutations()
+            await asyncio.gather(self.apply_task, return_exceptions=True)
+        elif stop_mutations is not None:
+            await stop_mutations()
+
+        # This barrier is deliberately immediately adjacent to release: once it
+        # returns there is no old process that can perform a stale post-CAS write.
+        if stop_mutations is not None:
+            await stop_mutations()
+        await self.backend.release()
+        with contextlib.suppress(FileNotFoundError):
+            self.socket_path.unlink()
+        # Keep the inode linked while locked.  Removing a locked flock file opens
+        # a split-lock race; a harmless private zero-byte lock is safer.
+        if self.lock_fd is not None:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
+
+def request_fields(request: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    for key in ("requestId", "generation"):
+        if key in request:
+            result[key] = request[key]
+    return result
+
+
+async def daemon_main() -> int:
+    try:
+        directory = runtime_dir()
+    except Exception:
+        return 2
+    daemon = ControllerDaemon(directory)
+    if not daemon.acquire():
+        return 0
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, daemon.stop_event.set)
+    try:
+        await daemon.start()
+        await daemon.stop_event.wait()
+    finally:
+        await daemon.close()
+    return 0
+
+
+def _connect_socket(path: pathlib.Path) -> socket.socket:
+    info = path.lstat()
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise PermissionError("controller socket has an invalid owner or type")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(os.fspath(path))
+        if hasattr(socket, "SO_PEERCRED"):
+            credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            _pid, uid, _gid = __import__("struct").unpack("3i", credentials)
+            if uid != os.getuid():
+                raise PermissionError("controller peer has a different owner")
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+async def attach_main() -> int:
+    try:
+        directory = runtime_dir()
+    except Exception as exc:
+        print(json.dumps({"protocol": PROTOCOL, "type": "error", "code": "runtime-unavailable", "message": str(exc)}), flush=True)
+        return 2
+    path = directory / "control.sock"
+    sock: socket.socket | None = None
+    deadline = time.monotonic() + 6.0
+    last_spawn = 0.0
+    while time.monotonic() < deadline:
+        try:
+            sock = await asyncio.to_thread(_connect_socket, path)
+            break
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            now = time.monotonic()
+            # Retrying the starter closes the narrow race where an old daemon
+            # holds flock while finishing its CAS cleanup.  flock still ensures
+            # that at most one starter becomes a writer.
+            if now - last_spawn >= 0.25:
+                subprocess.Popen(
+                    [sys.executable, str(pathlib.Path(__file__).resolve()), "daemon"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True, close_fds=True, env=os.environ.copy(),
+                )
+                last_spawn = now
+            await asyncio.sleep(0.05)
+    if sock is None:
+        print(json.dumps({"protocol": PROTOCOL, "type": "error", "code": "controller-unavailable", "message": "controller did not start"}), flush=True)
+        return 1
+    sock.setblocking(False)
+    reader, writer = await asyncio.open_unix_connection(sock=sock, limit=MAX_LINE + 1)
+
+    stdin_reader = asyncio.StreamReader(limit=MAX_LINE + 1)
+    stdin_protocol = asyncio.StreamReaderProtocol(stdin_reader)
+    await asyncio.get_running_loop().connect_read_pipe(lambda: stdin_protocol, sys.stdin.buffer)
+
+    async def input_pump() -> None:
+        while True:
+            try:
+                line = await stdin_reader.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                writer.close()
+                return
+            if not line:
+                with contextlib.suppress(Exception):
+                    writer.write_eof()
+                return
+            if len(line) > MAX_LINE or not line.endswith(b"\n"):
+                writer.close()
+                return
+            writer.write(line)
+            await writer.drain()
+
+    async def output_pump() -> None:
+        while True:
+            line = await reader.readline()
+            if not line:
+                return
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+
+    input_task = asyncio.create_task(input_pump())
+    output_task = asyncio.create_task(output_pump())
+    done, pending = await asyncio.wait((input_task, output_task), return_when=asyncio.FIRST_COMPLETED)
+    # On stdin EOF, close the lease immediately.  On daemon EOF, stop reading stdin.
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    for task in pending:
+        task.cancel()
+    return 0
+
+
+def main() -> int:
+    os.umask(0o077)
+    if len(sys.argv) != 2 or sys.argv[1] not in ("attach", "daemon"):
+        print("usage: Controller.py attach", file=sys.stderr)
+        return 2
+    if sys.argv[1] == "attach":
+        return asyncio.run(attach_main())
+    return asyncio.run(daemon_main())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
