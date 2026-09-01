@@ -32,7 +32,7 @@ Panel {
   readonly property int nominalContentWidth: Style.space(520)
   readonly property int nominalContentHeight: Style.space(440)
   readonly property var keyboardPanel: panel
-  readonly property Item normalKeyboardTarget: normalKeys
+  readonly property Item normalKeyboardTarget: keyCatcher
   readonly property var editorViewport: editorScroll
   // The dashboard deliberately keeps its full composition. Editors instead
   // fit their laid-out content, up to the same screen-aware maximum.
@@ -453,7 +453,7 @@ Panel {
     manualSearchObservedBusy = false
     autoSearchObservedBusy = false
     resultIndex = 0
-    if (restoreFocus !== false) Qt.callLater(function() { normalKeys.forceActiveFocus() })
+    if (restoreFocus !== false) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function useWeather() {
@@ -712,7 +712,7 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: true
-    focusTarget: root.editorMode === "normal" ? normalKeys : editorKeys
+    focusTarget: root.editorMode === "normal" ? keyCatcher : editorKeys
     contentWidth: panel.fittedContentWidth(root.nominalContentWidth)
     contentHeight: root.targetPanelContentHeight
 
@@ -727,20 +727,15 @@ Panel {
       NumberAnimation { id: panelHeightAnimation; duration: 140; easing.type: Easing.OutCubic }
     }
 
-    // Retain the native semantic catcher as the content host. A focused child
-    // owns this panel's map and accepts l before it can bubble to native h/l.
-    PanelKeyCatcher {
+    // PanelKeyCatcher reserves l for movement, so this panel uses a direct
+    // focus owner to keep its documented Location shortcut unambiguous.
+    Item {
       id: keyCatcher
       anchors.fill: parent
-      focus: false
-      blocked: true
-
-      Item {
-        id: normalKeys
-        anchors.fill: parent
-        focus: true
-        Keys.priority: Keys.BeforeItem
-        Keys.onPressed: function(event) { root.handleNormalKey(event) }
+      focus: true
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) {
+        if (root.editorMode === "normal") root.handleNormalKey(event)
       }
 
       // Both normal content and every editor occupy the same fitted viewport.
