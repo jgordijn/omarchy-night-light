@@ -29,7 +29,10 @@ TMP=$(mktemp -d)
 CONFIG="$TMP/night-light-qml"
 RESULT="$TMP/result.json"
 LOG="$TMP/quickshell.log"
-mkdir -p "$CONFIG" "$TMP/home"
+PANEL_CAPTURE_DIR=${NIGHT_LIGHT_PANEL_CAPTURE_DIR:-$ROOT/.work/captures/panel-timeline}
+mkdir -p "$CONFIG" "$TMP/home" "$PANEL_CAPTURE_DIR"
+rm -f -- "$PANEL_CAPTURE_DIR/panel-timeline-sunrise.png" \
+  "$PANEL_CAPTURE_DIR/panel-timeline-sunset.png"
 ln -s /usr/share/omarchy/shell/Ui "$CONFIG/Ui"
 ln -s /usr/share/omarchy/shell/Commons "$CONFIG/Commons"
 
@@ -44,12 +47,14 @@ ShellRoot {
 
   readonly property string resultPath: Quickshell.env("NIGHT_LIGHT_QML_RESULT")
   readonly property string widgetUrl: Quickshell.env("NIGHT_LIGHT_WIDGET_URL")
+  readonly property string panelCaptureDir: Quickshell.env("NIGHT_LIGHT_PANEL_CAPTURE_DIR")
   property var failures: []
   property var widget: null
   property int settingsWrites: 0
   property int switchCalls: 0
   property var heightCaptures: ({})
   property var afterSettleCallback: null
+  property var panelCaptureCallback: null
 
   function fail(message) { failures.push(String(message)) }
   function check(condition, message) { if (!condition) fail(message) }
@@ -57,6 +62,65 @@ ShellRoot {
     if (actual !== expected) fail(message + " expected=" + expected + " actual=" + actual)
   }
   function finite(value) { return isFinite(Number(value)) && Number(value) >= 0 }
+  function itemBounds(item, ancestor) {
+    var point = item.mapToItem(ancestor, 0, 0)
+    return ({ left: point.x, top: point.y, right: point.x + item.width,
+              bottom: point.y + item.height, width: item.width, height: item.height })
+  }
+  function intersects(left, right) {
+    return left.left < right.right - 0.01 && left.right > right.left + 0.01 &&
+      left.top < right.bottom - 0.01 && left.bottom > right.top + 0.01
+  }
+  function assertIntegratedDetail(panel, timeline, name) {
+    var ancestor = panel.normalKeyboardTarget
+    var label = timeline._pinnedLabelItem
+    var detail = itemBounds(label, ancestor)
+    var slot = itemBounds(timeline, ancestor)
+    var source = itemBounds(panel.sourceRowControl, ancestor)
+    var automatic = itemBounds(panel.automaticRowControl, ancestor)
+    check(label.visible, name + " integrated detail is visible")
+    check(detail.left >= slot.left - 0.01 && detail.right <= slot.right + 0.01 &&
+          detail.top >= slot.top - 0.01 && detail.bottom <= slot.bottom + 0.01,
+          name + " detail remains wholly inside the fixed Timeline slot")
+    check(!intersects(detail, source), name + " detail does not obscure the source row")
+    check(!intersects(detail, automatic), name + " detail does not obscure Automatic/On")
+    check(label.width + 0.01 >= label.naturalWidth,
+          name + " detail remains fully legible without integrated elision")
+  }
+
+  function afterPanelCaptureSettle(callback) {
+    panelCaptureCallback = callback
+    panelCaptureSettleTimer.restart()
+  }
+
+  function capturePanelTimeline(panel, timeline, done) {
+    panel.setFocus(0)
+    timeline.clearPin()
+    timeline._selectedEventKey = timeline._events[0].key
+    timeline.activateSelection()
+    afterPanelCaptureSettle(function() {
+      assertIntegratedDetail(panel, timeline, "sunrise")
+      panel.normalKeyboardTarget.grabToImage(function(sunriseImage) {
+        check(sunriseImage && sunriseImage.saveToFile(
+          panelCaptureDir + "/panel-timeline-sunrise.png"),
+          "full Panel sunrise collision capture saves")
+        timeline.clearPin()
+        timeline._selectedEventKey = timeline._events[1].key
+        timeline.activateSelection()
+        afterPanelCaptureSettle(function() {
+          assertIntegratedDetail(panel, timeline, "sunset")
+          panel.normalKeyboardTarget.grabToImage(function(sunsetImage) {
+            check(sunsetImage && sunsetImage.saveToFile(
+              panelCaptureDir + "/panel-timeline-sunset.png"),
+              "full Panel sunset collision capture saves")
+            timeline.clearPin()
+            panel.setFocus(1)
+            done()
+          })
+        })
+      })
+    })
+  }
 
   function captureEditorHeight(name, panel) {
     heightCaptures[name] = panel.editorHeightSnapshot()
@@ -92,8 +156,23 @@ ShellRoot {
     fakeBar.position = "top"
     fakeBar.vertical = false
     fakeBar.barSize = Style.bar.sizeHorizontal
+    afterEditorSettle(function() {
+      capturePanelTimeline(nightPanel, nightPanel.timelineControl, function() {
+        root.finishRuntimeChecksAfterCapture(widget, nightPanel)
+      })
+    })
+  }
+
+  function finishRuntimeChecksAfterCapture(widget, nightPanel) {
+    var forwardTab = ({ key: Qt.Key_Tab, text: "", modifiers: 0, accepted: false })
+    nightPanel.handleNormalKey(forwardTab)
+    equal(forwardTab.accepted, true, "Tab remains owned by neighboring-panel handoff")
+    var backwardTab = ({ key: Qt.Key_Backtab, text: "", modifiers: Qt.ShiftModifier, accepted: false })
+    nightPanel.handleNormalKey(backwardTab)
+    equal(backwardTab.accepted, true, "Shift+Tab remains owned by neighboring-panel handoff")
+    equal(switchCalls, 2, "both keyboard handoff directions route through the bar")
     nightPanel.switchPanel(1)
-    equal(switchCalls, 1, "panel handoff uses bar switch routing")
+    equal(switchCalls, 3, "panel handoff uses bar switch routing")
     widget.closeForPopoutSwitch()
     check(!widget.opened, "handoff close forwards immediately")
 
@@ -117,6 +196,17 @@ ShellRoot {
   }
 
   Timer {
+    id: panelCaptureSettleTimer
+    interval: 80
+    repeat: false
+    onTriggered: {
+      var callback = root.panelCaptureCallback
+      root.panelCaptureCallback = null
+      if (callback) callback()
+    }
+  }
+
+  Timer {
     id: editorSettleTimer
     interval: 220
     repeat: false
@@ -129,8 +219,9 @@ ShellRoot {
 
   QtObject {
     id: fakeService
-    property var settings: ({ automationEnabled: true, nightTemperature: 4000, transitionMinutes: 45,
+    property var settings: ({ id: "jgordijn.night-light", automationEnabled: true, nightTemperature: 4000, transitionMinutes: 45,
                               stockIndicator: { choice: "keep", before: null, after: null } })
+    property var inlineSettings: settings
     property bool initialized: true
     property bool busy: false
     property bool available: true
@@ -146,6 +237,44 @@ ShellRoot {
     property real nextBoundary: sunset
     property real overrideUntil: 0
     property var error: null
+    property var timeline: ({
+      revision: 7,
+      dateKey: "2026-09-01",
+      zoneId: "Europe/Amsterdam",
+      zoneSource: "location",
+      nowMs: 1788273420000,
+      markerWallMs: 59820000,
+      markerOffsetMinutes: 120,
+      markerFold: 0,
+      markerAmbiguous: false,
+      status: "normal",
+      stateAtMidnight: "night",
+      isDayNow: true,
+      events: [
+        ({ key: "sunrise:1788238305216:120:0", kind: "sunrise",
+           epochMs: 1788238305216, dateKey: "2026-09-01", wallMs: 24705216,
+           offsetMinutes: 120, fold: 0, ambiguous: false }),
+        ({ key: "sunset:1788287423925:120:0", kind: "sunset",
+           epochMs: 1788287423925, dateKey: "2026-09-01", wallMs: 73823925,
+           offsetMinutes: 120, fold: 0, ambiguous: false })
+      ],
+      daylightSegments: [({ startWallMs: 24705216, endWallMs: 73823925 })],
+      displayTimes: ({
+        sunset: ({ epochMs: 1788287423925, dateKey: "2026-09-01", wallMs: 73823925,
+                   offsetMinutes: 120, fold: 0, ambiguous: false }),
+        sunrise: ({ epochMs: 1788325200000, dateKey: "2026-09-02", wallMs: 25200000,
+                    offsetMinutes: 120, fold: 0, ambiguous: false }),
+        nextBoundary: ({ epochMs: 1788287423925, dateKey: "2026-09-01", wallMs: 73823925,
+                         offsetMinutes: 120, fold: 0, ambiguous: false }),
+        overrideUntil: null
+      })
+    })
+    property var moonPhase: ({
+      ok: true, calculatedAtMs: 1788273420000, phase: 0.6495230623756667,
+      ageDays: 19.180798505557288, illumination: 0.7948970595391965,
+      trend: "waning", phaseId: "waning-gibbous", phaseName: "Waning Gibbous",
+      orientation: "northern", orientationSource: "location"
+    })
     property var searchResults: []
     property var automaticCandidate: null
     property bool locationEditorOpen: false
@@ -166,6 +295,7 @@ ShellRoot {
     property int forgetCalls: 0
     property int stockKeepCalls: 0
     property int stockHideCalls: 0
+    property int warmthStepCalls: 0
     function warm() { warmCalls++; return true }
     function daylight() { daylightCalls++; return true }
     function resume() { resumeCalls++; return true }
@@ -183,13 +313,29 @@ ShellRoot {
     function keepStockIndicator() { stockKeepCalls++; return true }
     function hideStockIndicator(items) { stockHideCalls++; return items.indexOf("NightLight") >= 0 }
     function restoreStockIndicator() { return "not-hidden" }
+    function stepNightTemperature(direction) {
+      warmthStepCalls++
+      if (direction !== -1 && direction !== 1) return false
+      var next = Math.max(1000, Math.min(6500, Number(settings.nightTemperature) + direction * 250))
+      if (next === Number(settings.nightTemperature)) return false
+      var entry = JSON.parse(JSON.stringify(settings))
+      entry.nightTemperature = next
+      settings = entry
+      inlineSettings = entry
+      return true
+    }
   }
 
   QtObject {
     id: fakeShell
     property var shellConfig: ({ bar: { layout: { left: [], center: [], right: [{ id: "omarchy.indicators" }] } } })
+    property var lastSettingsEntry: null
     function serviceFor(id) { return id === "jgordijn.night-light" ? fakeService : null }
-    function updateEntryInline(id, entry) { root.settingsWrites++; return true }
+    function updateEntryInline(id, entry) {
+      root.settingsWrites++
+      if (id === "jgordijn.night-light") lastSettingsEntry = JSON.parse(JSON.stringify(entry))
+      return true
+    }
   }
 
   QtObject {
@@ -260,6 +406,25 @@ ShellRoot {
         equal(nightPanel.stateTitle, "Daylight", "day panel copy")
         equal(nightPanel.nominalContentWidth, Style.space(520), "nominal panel width")
         equal(nightPanel.nominalContentHeight, Style.space(440), "nominal panel height")
+        var timelineControl = nightPanel.timelineControl
+        check(timelineControl !== null, "dashboard instantiates DaylightTimeline")
+        check(timelineControl.snapshot === fakeService.timeline,
+              "panel binds the complete atomic Service timeline snapshot")
+        check(timelineControl.moonPhase === fakeService.moonPhase,
+              "panel binds the complete Service lunar snapshot")
+        equal(timelineControl.height, Style.space(58), "timeline replaces the old slot without changing geometry")
+        equal(nightPanel.stateDetail,
+              "Sunset at " + nightPanel.formatProjectedTime(fakeService.timeline.displayTimes.sunset),
+              "hero event copy uses the projected civil display time")
+        var projectedFixture = fakeService.timeline
+        var missingProjection = JSON.parse(JSON.stringify(projectedFixture))
+        missingProjection.displayTimes.sunset = null
+        missingProjection.displayTimes.nextBoundary = null
+        fakeService.timeline = missingProjection
+        equal(nightPanel.stateDetail, "Sunset at —",
+              "missing projection never falls back to the stable epoch in the shell timezone")
+        fakeService.timeline = projectedFixture
+        equal(nightPanel.focusIndex, 1, "Automatic is the initial normal focus")
         check(nightPanel.keyboardPanel.owner === widget, "KeyboardPanel owner is host widget")
         check(nightPanel.keyboardPanel.anchorItem !== null, "actual WidgetButton is the anchor")
 
@@ -296,13 +461,32 @@ ShellRoot {
         widget.resumeAutomatic()
         equal(fakeService.resumeCalls, 0, "middle-click is a no-op while automatic")
 
-        nightPanel.persistSettings({ nightTemperature: 4250 })
-        equal(widget.settings.nightTemperature, 4250, "settings update host immediately")
-        equal(nightPanel.settings.nightTemperature, 4250, "settings update panel immediately")
-        equal(root.settingsWrites, 1, "settings persist through updateEntryInline")
+        nightPanel.persistSettings({ transitionMinutes: 30 })
+        equal(widget.settings.transitionMinutes, 30, "settings update host immediately")
+        equal(nightPanel.settings.transitionMinutes, 30, "settings update panel immediately")
+        equal(root.settingsWrites, 1, "ordinary settings persist through updateEntryInline")
         nightPanel.stepWarmth(1)
+        equal(fakeService.warmthStepCalls, 1, "one warmth step makes exactly one Service call")
+        equal(widget.settings.nightTemperature, 4250, "Service warmth updates host immediately")
+        equal(nightPanel.settings.nightTemperature, 4250, "Service warmth updates panel immediately")
+        equal(root.settingsWrites, 1, "Panel performs no direct Warmth persistence")
+
+        // Exact stale multi-panel regression: Service has canonically committed
+        // 4250 K while this panel and host still show their old 4000 K snapshot.
+        var stalePanelEntry = JSON.parse(JSON.stringify(nightPanel.settings))
+        stalePanelEntry.nightTemperature = 4000
+        nightPanel.settings = stalePanelEntry
+        widget.settings = JSON.parse(JSON.stringify(stalePanelEntry))
+        equal(fakeService.inlineSettings.nightTemperature, 4250,
+          "stale-panel setup retains Service canonical 4250 K")
         nightPanel.stepTransition(1)
-        check(root.settingsWrites >= 3, "keyboard value changes persist complete transactions")
+        equal(root.settingsWrites, 2, "other keyboard value changes persist complete transactions")
+        equal(fakeShell.lastSettingsEntry.nightTemperature, 4250,
+          "transition edit retains canonical Service 4250 K over stale panel 4000 K")
+        equal(nightPanel.settings.nightTemperature, 4250,
+          "transition transaction repairs the stale panel Warmth snapshot")
+        equal(widget.settings.nightTemperature, 4250,
+          "transition transaction repairs the stale host Warmth snapshot")
 
         var dashboardTargetHeight = nightPanel.targetPanelContentHeight
         equal(dashboardTargetHeight, nightPanel.normalPanelContentHeight, "normal dashboard keeps its composed height")
@@ -355,6 +539,62 @@ ShellRoot {
         check(fakeBar.activePopout === widget, "open claims popout as host widget")
         check(nightPanel.keyboardPanel.focusTarget === nightPanel.normalKeyboardTarget,
           "normal mode routes live focus to its conflict-free key target")
+        equal(nightPanel.focusIndex, 1, "keyboard open starts on Automatic, not Timeline")
+        equal(timelineControl._revealArrows, false,
+              "keyboard open on Automatic leaves Timeline arrows at rest")
+
+        var upToTimeline = ({ key: Qt.Key_Up, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(upToTimeline)
+        equal(upToTimeline.accepted, true, "Up from Automatic is consumed")
+        equal(nightPanel.focusIndex, 0, "Up from Automatic reaches Timeline")
+        check(timelineControl.current, "Timeline receives native roving focus chrome")
+        check(timelineControl._selectedEventKey.indexOf("sunset:") === 0,
+              "first Timeline focus selects the next real event")
+
+        var timelineLeft = ({ key: Qt.Key_Left, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(timelineLeft)
+        check(timelineControl._selectedEventKey.indexOf("sunrise:") === 0,
+              "Timeline Left routes to event selection")
+        var timelineRight = ({ key: Qt.Key_Right, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(timelineRight)
+        check(timelineControl._selectedEventKey.indexOf("sunset:") === 0,
+              "Timeline Right routes to event selection")
+        var timelineEnter = ({ key: Qt.Key_Return, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(timelineEnter)
+        check(timelineControl._pinnedEventKey.indexOf("sunset:") === 0,
+              "Timeline Enter pins the selected event")
+        var timelineSpace = ({ key: Qt.Key_Space, text: " ", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(timelineSpace)
+        equal(timelineControl._pinnedEventKey, "", "Timeline Space unpins the selected event")
+
+        timelineControl.focusRequested()
+        equal(nightPanel.focusIndex, 0, "pointer entry moves roving focus to Timeline")
+        var downToAutomatic = ({ key: Qt.Key_Down, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(downToAutomatic)
+        equal(nightPanel.focusIndex, 1, "Down from Timeline returns to Automatic")
+
+        var firstAtomicTimeline = fakeService.timeline
+        var replacementTimeline = JSON.parse(JSON.stringify(firstAtomicTimeline))
+        replacementTimeline.revision = 8
+        replacementTimeline.markerWallMs = 60000000
+        fakeService.timeline = replacementTimeline
+        check(timelineControl.snapshot === replacementTimeline,
+              "timeline replacement crosses the binding as one object")
+        equal(timelineControl._timeline.revision, 8,
+              "component consumes the replacement transaction atomically")
+        fakeService.timeline = firstAtomicTimeline
+
+        nightPanel.setFocus(0)
+        nightPanel.handleNormalKey(({ key: Qt.Key_Return, text: "", modifiers: 0, accepted: false }))
+        check(timelineControl._pinnedEventKey !== "", "close-clear test prepared a pin")
+        var closeKey = ({ key: Qt.Key_Escape, text: "", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(closeKey)
+        equal(closeKey.accepted, true, "Escape remains an immediate close")
+        check(!widget.opened, "Escape closes without a two-step pin dismissal")
+        equal(timelineControl._pinnedEventKey, "", "close clears the Timeline pin")
+        widget.open()
+        equal(nightPanel.focusIndex, 1, "reopen restores Automatic initial focus")
+
         var fixedWidth = nightPanel.keyboardPanel.contentWidth
         var dashboardHeight = nightPanel.targetPanelContentHeight
         heightCaptures.dashboard = ({ mode: "normal", target: dashboardHeight,
@@ -399,6 +639,7 @@ QML
 
 NIGHT_LIGHT_QML_RESULT="$RESULT" \
 NIGHT_LIGHT_WIDGET_URL="file://$ROOT/BarWidget.qml" \
+NIGHT_LIGHT_PANEL_CAPTURE_DIR="$PANEL_CAPTURE_DIR" \
 HOME="$TMP/home" \
 XDG_CONFIG_HOME="$TMP/home/.config" \
 XDG_CACHE_HOME="$TMP/home/.cache" \
@@ -429,8 +670,19 @@ if ! jq -e '.ok == true' "$RESULT" >/dev/null; then
 fi
 
 # Runtime loading is authoritative. Reject diagnostics attributable to these files.
-if grep -E '(BarWidget\.qml|Panel\.qml).*(Error|is not a type|Cannot assign|ReferenceError|TypeError|Unable to assign|Binding loop|NaN)' "$LOG" >&2; then
+if grep -E '(BarWidget\.qml|Panel\.qml|DaylightTimeline\.qml).*(Error|is not a type|Cannot assign|ReferenceError|TypeError|Unable to assign|Binding loop|NaN)' "$LOG" >&2; then
   fail "plugin-specific QML diagnostics were emitted"
+fi
+
+for panel_capture in panel-timeline-sunrise.png panel-timeline-sunset.png; do
+  [[ -s $PANEL_CAPTURE_DIR/$panel_capture ]] ||
+    fail "missing full Panel collision capture: $panel_capture"
+done
+if command -v identify >/dev/null 2>&1; then
+  SUNRISE_GEOMETRY=$(identify -format '%wx%h' "$PANEL_CAPTURE_DIR/panel-timeline-sunrise.png")
+  SUNSET_GEOMETRY=$(identify -format '%wx%h' "$PANEL_CAPTURE_DIR/panel-timeline-sunset.png")
+  [[ $SUNRISE_GEOMETRY == "$SUNSET_GEOMETRY" ]] ||
+    fail "Panel collision capture geometry changed between pin states"
 fi
 
 CAPTURE=${NIGHT_LIGHT_QML_HEIGHT_CAPTURE:-$ROOT/.work/captures/ui-editor-heights.json}
@@ -440,5 +692,6 @@ printf 'qml-entrypoints-test: runtime heights dashboard=%s location=%s manual=%s
   "$(jq -r '.editorHeights.dashboard.actual' "$RESULT")" \
   "$(jq -r '.editorHeights.location.actual' "$RESULT")" \
   "$(jq -r '.editorHeights.manual.actual' "$RESULT")"
-printf 'qml-entrypoints-test: capture %s\n' "$CAPTURE"
+printf 'qml-entrypoints-test: height capture %s\n' "$CAPTURE"
+printf 'qml-entrypoints-test: panel collision captures %s\n' "$PANEL_CAPTURE_DIR"
 printf 'qml-entrypoints-test: PASS\n'

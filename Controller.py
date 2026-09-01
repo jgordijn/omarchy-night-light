@@ -34,6 +34,7 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PROTOCOL = 1
 VERSION = "1.0.0"
@@ -62,6 +63,12 @@ SOURCE_PRECISION = {
 # pathname sockets.  Keep this explicit: pathlib character counts are not the
 # bound enforced by AF_UNIX.
 UNIX_SOCKET_PATH_BYTES = 107
+# Distinguish an intentionally captured no-apply state (None) from callers
+# whose status publication is not tied to backend apply authority.
+_UNBOUND_APPLY_TOKEN = object()
+DISPLAY_TIME_KEYS = frozenset(("sunset", "sunrise", "nextBoundary", "overrideUntil"))
+ECMASCRIPT_DATE_LIMIT_MS = 8_640_000_000_000_000
+UTC_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 
 
 def _open_directory(path: pathlib.Path) -> int:
@@ -498,16 +505,197 @@ def validate_desired(raw: Any) -> dict[str, Any]:
     return {"kind": "temperature", "temperature": value}
 
 
+def _zone_info(key: str) -> ZoneInfo | None:
+    """Resolve one bounded IANA key without accepting filesystem paths."""
+    if not key or len(key) > 80 or key.startswith("/") or "\0" in key:
+        return None
+    try:
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _system_zone() -> tuple[str, ZoneInfo]:
+    """Resolve the live shell/system IANA zone, with UTC as a safe authority."""
+    candidates: list[str] = []
+    environment_zone = os.environ.get("TZ", "")
+    if environment_zone.startswith(":"):
+        environment_zone = environment_zone[1:]
+    if environment_zone.startswith("/usr/share/zoneinfo/"):
+        environment_zone = environment_zone[len("/usr/share/zoneinfo/"):]
+    if environment_zone:
+        candidates.append(environment_zone)
+
+    local_zone = dt.datetime.now().astimezone().tzinfo
+    local_key = getattr(local_zone, "key", None)
+    if isinstance(local_key, str):
+        candidates.append(local_key)
+
+    with contextlib.suppress(OSError):
+        resolved = os.path.realpath("/etc/localtime")
+        marker = "/zoneinfo/"
+        if marker in resolved:
+            candidates.append(resolved.split(marker, 1)[1])
+    with contextlib.suppress(OSError, UnicodeError):
+        timezone_text = pathlib.Path("/etc/timezone").read_text().strip()
+        if timezone_text:
+            candidates.append(timezone_text)
+
+    for key in candidates:
+        zone = _zone_info(key)
+        if zone is not None:
+            return key, zone
+    # UTC is itself an installed IANA key in CPython's zoneinfo search path.
+    return "UTC", ZoneInfo("UTC")
+
+
+def _epoch_datetime(epoch_ms: Any, zone: ZoneInfo) -> dt.datetime:
+    if (
+        isinstance(epoch_ms, bool)
+        or not isinstance(epoch_ms, (int, float))
+        or not math.isfinite(epoch_ms)
+        or abs(epoch_ms) > ECMASCRIPT_DATE_LIMIT_MS
+    ):
+        raise ValueError("invalid epoch")
+    try:
+        return (UTC_EPOCH + dt.timedelta(milliseconds=epoch_ms)).astimezone(zone)
+    except (OverflowError, ValueError) as exc:
+        # zoneinfo is backed by datetime, whose supported calendar is narrower
+        # than ECMAScript's.  An epoch that cannot be projected is not usable.
+        raise ValueError("invalid epoch") from exc
+
+
+def _offset_minutes(projected: dt.datetime) -> int:
+    offset = projected.utcoffset()
+    if offset is None:
+        raise ValueError("invalid timezone offset")
+    # Current IANA offsets are minute-aligned.  int() also gives the conventional
+    # minute projection for the few historical local-mean-time second offsets.
+    return int(offset.total_seconds() / 60)
+
+
+def _ambiguous_wall_time(projected: dt.datetime, zone: ZoneInfo) -> bool:
+    naive = projected.replace(tzinfo=None)
+    first = naive.replace(tzinfo=zone, fold=0)
+    second = naive.replace(tzinfo=zone, fold=1)
+    if first.utcoffset() == second.utcoffset():
+        return False
+
+    def valid(candidate: dt.datetime) -> bool:
+        returned = candidate.astimezone(dt.timezone.utc).astimezone(zone)
+        return returned.replace(tzinfo=None) == naive and returned.fold == candidate.fold
+
+    return valid(first) and valid(second)
+
+
+def _projected_time(epoch_ms: Any, zone: ZoneInfo) -> dict[str, Any]:
+    projected = _epoch_datetime(epoch_ms, zone)
+    return {
+        "epochMs": epoch_ms,
+        "dateKey": projected.date().isoformat(),
+        "wallMs": (
+            projected.hour * 3_600_000
+            + projected.minute * 60_000
+            + projected.second * 1_000
+            + projected.microsecond // 1_000
+        ),
+        "offsetMinutes": _offset_minutes(projected),
+        "fold": projected.fold,
+        "ambiguous": _ambiguous_wall_time(projected, zone),
+    }
+
+
+def _boundary_epoch_ms(day: dt.date, zone: ZoneInfo) -> int:
+    # fold=0 chooses the first midnight when it repeats.  For a midnight gap,
+    # zoneinfo's pre-transition interpretation maps to the first real instant
+    # of that civil date, which is the required epoch boundary.
+    local_midnight = dt.datetime.combine(day, dt.time(), tzinfo=zone).replace(fold=0)
+    utc_midnight = local_midnight.astimezone(dt.timezone.utc)
+    delta = utc_midnight - UTC_EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000 + delta.microseconds // 1_000
+
+
+def project_civil_day(request: dict[str, Any]) -> dict[str, Any]:
+    """Validate and project one request into a single local-civil transaction."""
+    requested_zone = request.get("zoneId")
+    if not isinstance(requested_zone, str) or len(requested_zone) > 80:
+        raise ValueError("invalid timezone")
+    zone = _zone_info(requested_zone)
+    if zone is None:
+        zone_id, zone = _system_zone()
+        zone_source = "system"
+    else:
+        zone_id = requested_zone
+        zone_source = "location"
+
+    now = _epoch_datetime(request.get("nowMs"), zone)
+    date_key = now.date().isoformat()
+    marker = _projected_time(request.get("nowMs"), zone)
+
+    raw_events = request.get("events", [])
+    if not isinstance(raw_events, list) or len(raw_events) > 8:
+        raise ValueError("invalid events")
+    events = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict) or raw_event.get("kind") not in ("sunrise", "sunset"):
+            raise ValueError("invalid event")
+        event = _projected_time(raw_event.get("epochMs"), zone)
+        if event["dateKey"] == date_key:
+            events.append({"kind": raw_event["kind"], **event})
+    events.sort(key=lambda event: event["epochMs"])
+
+    raw_display_times = request.get("displayTimes", {})
+    if not isinstance(raw_display_times, dict) or not set(raw_display_times).issubset(DISPLAY_TIME_KEYS):
+        raise ValueError("invalid display times")
+    display_times: dict[str, Any] = {}
+    for key, epoch_ms in raw_display_times.items():
+        display_times[key] = None if epoch_ms is None else _projected_time(epoch_ms, zone)
+
+    try:
+        next_day = now.date() + dt.timedelta(days=1)
+        day_start_ms = _boundary_epoch_ms(now.date(), zone)
+        day_end_ms = _boundary_epoch_ms(next_day, zone)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("invalid epoch") from exc
+    return {
+        "dateKey": date_key,
+        "zoneId": zone_id,
+        "zoneSource": zone_source,
+        "dayStartMs": day_start_ms,
+        "dayEndMs": day_end_ms,
+        "markerWallMs": marker["wallMs"],
+        "markerOffsetMinutes": marker["offsetMinutes"],
+        "markerFold": marker["fold"],
+        "markerAmbiguous": marker["ambiguous"],
+        "events": events,
+        "displayTimes": display_times,
+    }
+
+
 class ApplySuperseded(Exception):
     """An apply token was replaced before it could mutate the display."""
+
+
+class ExternalActual(Exception):
+    """A schedule compare-and-swap found an unobserved external winner."""
+
+    def __init__(self, actual: Actual):
+        super().__init__("actual display state changed")
+        self.actual = actual
 
 
 class ApplyToken:
     """Attachment/generation-labelled cancellation visible to loop and worker."""
 
-    def __init__(self, generation: int, attachment_epoch: int):
+    def __init__(
+        self,
+        generation: int,
+        attachment_epoch: int,
+        if_actual: dict[str, Any] | None = None,
+    ):
         self.generation = generation
         self.attachment_epoch = attachment_epoch
+        self.if_actual = if_actual
         self._async_event = asyncio.Event()
         self._thread_event = threading.Event()
         self._stop_child_event = asyncio.Event()
@@ -547,10 +735,17 @@ class Backend:
         self.baseline: Actual | None = None
         self.actual: Actual | None = None
         self.last_ack: dict[str, Any] | None = None
+        self.last_ack_owner: tuple[int, int] | None = None
+        self.last_ack_chain_available = False
+        # Monotonic identity for the ack allowance represented above. Statuses
+        # snapshot this before output so an older observation cannot consume a
+        # newer same-token ack created while that output is blocked.
+        self.last_ack_chain_version = 0
         # Kept distinct from last_ack: a timed-out child may have changed the
         # compositor before it was terminated even though verification did not
         # complete.  Release may CAS against either truthful possibility.
         self.last_attempt: dict[str, Any] | None = None
+        self.last_attempt_owner: tuple[int, int] | None = None
         self.last_temperature_write = 0.0
         self.owned_pid: int | None = None
         self.owned_start: str | None = None
@@ -706,17 +901,39 @@ class Backend:
         return actual
 
     def _reconcile_attempt(self, actual: Actual) -> bool:
-        """Resolve one uncertain mutation against a serialized observation."""
+        """Resolve one uncertain mutation against this serialized observation."""
         attempt = self.last_attempt
+        owner = self.last_attempt_owner
         if attempt is not None:
             # Once the mutating child has stopped, its attempt has exactly one
             # truthful resolution.  Do not leave a stale candidate available to
             # a later observation or compare-and-swap release.
             self.last_attempt = None
+            self.last_attempt_owner = None
             if actual.matches(attempt):
                 self.last_ack = attempt
+                self.last_ack_owner = owner
+                self.last_ack_chain_available = owner is not None
+                self.last_ack_chain_version += 1
                 return True
-        return actual.matches(self.last_ack)
+        # Equality with arbitrary older plugin history is observational, not
+        # proof that this particular preflight consumed a controller attempt.
+        return False
+
+    def note_observation_published(self, observed_ack_version: int) -> None:
+        """Consume only the exact ack allowance visible to this observation."""
+        if observed_ack_version == self.last_ack_chain_version:
+            self.last_ack_chain_available = False
+
+    def _ack_chain_matches(self, actual: Actual, token: ApplyToken | None) -> bool:
+        return bool(
+            token is not None
+            and self.last_ack_chain_available
+            and self.last_ack_owner is not None
+            and self.last_ack_owner[0] == token.attachment_epoch
+            and self.last_ack_owner[1] < token.generation
+            and actual.matches(self.last_ack)
+        )
 
     async def probe(self, *, publish: bool = True) -> Actual:
         async with self.command_lock:
@@ -825,8 +1042,11 @@ class Backend:
         *,
         restoring: bool = False,
         superseded: ApplyToken | None = None,
+        if_actual: dict[str, Any] | None = None,
     ) -> Actual:
         desired = validate_desired(desired)
+        if if_actual is not None:
+            if_actual = validate_desired(if_actual)
         if superseded is not None and superseded.is_set():
             raise ApplySuperseded()
 
@@ -864,13 +1084,28 @@ class Backend:
             if superseded is not None and superseded.is_set():
                 raise ApplySuperseded()
             self.actual = actual
+            reconciled_attempt = False
             if not restoring:
-                self._reconcile_attempt(actual)
+                reconciled_attempt = self._reconcile_attempt(actual)
             if actual.matches(desired):
                 return actual
+            if (
+                not restoring
+                and if_actual is not None
+                and not actual.matches(if_actual)
+                and not reconciled_attempt
+                and not self._ack_chain_matches(actual, superseded)
+            ):
+                # Probe and decision share command_lock, so no controller write
+                # can slip between this failed CAS and external adoption.
+                raise ExternalActual(actual)
 
             if not restoring:
                 self.last_attempt = desired
+                self.last_attempt_owner = (
+                    (superseded.attachment_epoch, superseded.generation)
+                    if superseded is not None else None
+                )
             if desired["kind"] == "identity":
                 await self._run(
                     [self.hyprctl, "hyprsunset", "identity", "true"],
@@ -895,10 +1130,15 @@ class Backend:
             if not actual.matches(desired):
                 if not restoring:
                     self.last_attempt = None
+                    self.last_attempt_owner = None
                 raise RuntimeError("backend verification failed")
             if not restoring:
                 self.last_ack = desired
+                self.last_ack_owner = self.last_attempt_owner
+                self.last_ack_chain_available = self.last_ack_owner is not None
+                self.last_ack_chain_version += 1
                 self.last_attempt = None
+                self.last_attempt_owner = None
             return actual
 
     def _owned_identity(self) -> tuple[int, str, str, str] | None:
@@ -1052,24 +1292,33 @@ class Client:
         self.writer = writer
         self.write_lock = asyncio.Lock()
         self.tasks: dict[str, asyncio.Task[Any]] = {}
+        self.timeline_tasks: set[asyncio.Task[Any]] = set()
 
     async def send(
         self,
         value: dict[str, Any],
         *,
         guard: Callable[[], bool] | None = None,
-    ) -> None:
+    ) -> bool:
         if self.writer.is_closing():
-            return
+            return False
         data = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         async with self.write_lock:
             # Check after waiting for the output lock and immediately before
-            # publication, so an attachment epoch change cannot queue an old
-            # status behind an earlier message.
+            # publication, so an attachment epoch/generation change cannot
+            # queue an old status behind an earlier message. The return value
+            # lets ownership bookkeeping happen only after this guarded write.
             if guard is not None and not guard():
-                return
+                return False
             self.writer.write(data)
             await self.writer.drain()
+            # drain may yield long enough for a newer generation or attachment
+            # to supersede this response. Bytes can already be buffered, but
+            # callers reject their stale correlation; do not report an
+            # authoritative publication or consume owned-ack allowance.
+            if guard is not None and not guard():
+                return False
+            return True
 
 
 @dataclass
@@ -1104,6 +1353,7 @@ class ControllerDaemon:
         self.active_attachment_epoch = 0
         self.attachment_sessions: dict[Any, AttachmentSession] = {}
         self.network_token: dict[str, tuple[Any, ...] | None] = {"geocode": None, "auto": None}
+        self.timeline_token: object | None = None
         self.state_transaction_lock = asyncio.Lock()
         self.apply_idle = asyncio.Event()
         self.apply_idle.set()
@@ -1176,8 +1426,11 @@ class ControllerDaemon:
         client: Client | None = None,
         *,
         expected_epoch: int | None = None,
-        expected_token: ApplyToken | None = None,
+        expected_token: ApplyToken | None | object = _UNBOUND_APPLY_TOKEN,
     ) -> None:
+        # Snapshot actual and its ack-chain identity in one event-loop turn.
+        # Publication may block, but it can consume only this observed version.
+        observed_ack_version = getattr(self.backend, "last_ack_chain_version", 0)
         actual = self.backend.actual.json() if self.backend.actual else {"kind": "unavailable"}
         response = {
             "protocol": PROTOCOL, "type": "backendStatus", "available": self.backend_ready,
@@ -1196,10 +1449,23 @@ class ControllerDaemon:
                     return False
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     return False
-                return expected_token is None or self.apply_is_current(target, expected_token)
+                if expected_token is _UNBOUND_APPLY_TOKEN:
+                    return True
+                if expected_token is None:
+                    return self.apply_token is None
+                return self.apply_is_current(target, expected_token)
 
             with contextlib.suppress(Exception):
-                await target.send(response, guard=still_current)
+                # Client.send rechecks authority both after the output lock and
+                # after drain. False means either no bytes were written or the
+                # buffered correlation became stale during drain; neither is an
+                # authoritative Service observation, so neither may consume the
+                # ack chain needed by a rapid successor's truthful ifActual.
+                did_publish = await target.send(response, guard=still_current)
+                if did_publish:
+                    published = getattr(self.backend, "note_observation_published", None)
+                    if published is not None:
+                        published(observed_ack_version)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         sock = writer.get_extra_info("socket")
@@ -1236,10 +1502,32 @@ class ControllerDaemon:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     await self.error(client, {}, "invalid-json", "request is not valid JSON")
                     continue
-                await self.dispatch(client, request)
+                if (
+                    isinstance(request, dict)
+                    and request.get("operation") == "projectCivilDay"
+                ):
+                    # Projection runs in a worker thread.  Do not serialize the
+                    # socket reader behind that worker: the next NDJSON request
+                    # must be admitted immediately so it can revoke stale
+                    # timeline authority before the old result publishes.
+                    task = asyncio.create_task(self.dispatch(client, request))
+                    client.timeline_tasks.add(task)
+
+                    def projection_done(completed: asyncio.Task[Any]) -> None:
+                        client.timeline_tasks.discard(completed)
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            completed.result()
+
+                    task.add_done_callback(projection_done)
+                else:
+                    await self.dispatch(client, request)
         finally:
             for task in client.tasks.values():
                 task.cancel()
+            for task in client.timeline_tasks:
+                task.cancel()
+            if client.timeline_tasks:
+                await asyncio.gather(*client.timeline_tasks, return_exceptions=True)
             self.clients.discard(client)
             self.attachment_sessions.pop(client, None)
             writer.close()
@@ -1283,7 +1571,7 @@ class ControllerDaemon:
         self.attachment_epoch += 1
         session = AttachmentSession(
             self.attachment_epoch,
-            {"backend": -1, "state": -1, "geocode": -1, "auto": -1},
+            {"backend": -1, "state": -1, "geocode": -1, "auto": -1, "timeline": -1},
         )
         self.attachment_sessions[client] = session
         self.active_attachment_epoch = session.epoch
@@ -1302,12 +1590,15 @@ class ControllerDaemon:
         if old_apply_token is not None:
             old_apply_token.set()
         self.network_token = {"geocode": None, "auto": None}
+        self.timeline_token = None
         for attached in self.clients:
             if attached is client:
                 continue
             for task in list(attached.tasks.values()):
                 task.cancel()
             attached.tasks.clear()
+            for task in list(getattr(attached, "timeline_tasks", ())):
+                task.cancel()
         return session
 
     def is_current_client(self, client: Any) -> bool:
@@ -1387,13 +1678,19 @@ class ControllerDaemon:
                 if actual is None:
                     await self.error(client, request, "stale-generation", "request is obsolete")
                     return
-            await self.broadcast_status(request, client, expected_epoch=epoch)
+            await self.broadcast_status(
+                request, client, expected_epoch=epoch, expected_token=token
+            )
         elif operation == "setDesired":
             if not self.accept_generation(client, "backend", generation):
                 await self.error(client, request, "stale-generation", "request is obsolete")
                 return
             try:
                 desired = validate_desired(request.get("desired"))
+                if_actual = (
+                    validate_desired(request.get("ifActual"))
+                    if "ifActual" in request else None
+                )
             except ValueError as exc:
                 await self.error(client, request, "invalid-request", str(exc))
                 return
@@ -1422,10 +1719,45 @@ class ControllerDaemon:
             self.deferred = None
             if self.apply_token is not None:
                 self.apply_token.set()
-            token = ApplyToken(generation, self.attachment_sessions[client].epoch)
+            token = ApplyToken(
+                generation,
+                self.attachment_sessions[client].epoch,
+                if_actual if intent == "schedule" else None,
+            )
             self.apply_token = token
             self.pending = (desired, client, metadata, token)
             self.apply_event.set()
+        elif operation == "projectCivilDay":
+            if not self.accept_generation(client, "timeline", generation):
+                await self.error(client, request, "stale-generation", "request is obsolete")
+                return
+            epoch = self.attachment_sessions[client].epoch
+            timeline_token = object()
+            self.timeline_token = timeline_token
+
+            def timeline_is_current() -> bool:
+                return bool(
+                    self.timeline_token is timeline_token
+                    and self.generation_is_current(client, "timeline", generation)
+                    and self.attachment_sessions.get(client) is not None
+                    and self.attachment_sessions[client].epoch == epoch
+                )
+
+            try:
+                projection = await asyncio.to_thread(project_civil_day, request)
+            except ValueError as exc:
+                if timeline_is_current():
+                    await self.error(client, request, "invalid-request", str(exc))
+                return
+            if not timeline_is_current():
+                return
+            response = {
+                "protocol": PROTOCOL,
+                "type": "civilDay",
+                **request_fields(request),
+                "projection": projection,
+            }
+            await client.send(response, guard=timeline_is_current)
         elif operation == "readLocationState":
             outcome, state = await asyncio.to_thread(self.store.read)
             await client.send({"protocol": PROTOCOL, "type": "locationState", "outcome": outcome, "state": state, **request_fields(request)})
@@ -1564,7 +1896,10 @@ class ControllerDaemon:
                         break
                     self.apply_idle.clear()
                     try:
-                        await self.backend.apply(desired, superseded=token)
+                        apply_kwargs: dict[str, Any] = {"superseded": token}
+                        if token.if_actual is not None:
+                            apply_kwargs["if_actual"] = token.if_actual
+                        await self.backend.apply(desired, **apply_kwargs)
                         if not self.apply_is_current(client, token):
                             superseded = True
                             break
@@ -1572,6 +1907,37 @@ class ControllerDaemon:
                         self.backend_error = None
                         break
                     except ApplySuperseded:
+                        superseded = True
+                        break
+                    except ExternalActual as external:
+                        if not self.apply_is_current(client, token):
+                            superseded = True
+                            break
+                        self.backend.actual = external.actual
+                        self.backend_ready = True
+                        self.backend_error = None
+                        self.runtime_override = {
+                            "target": {
+                                "kind": external.actual.kind,
+                                **(
+                                    {"temperature": external.actual.temperature}
+                                    if external.actual.kind == "temperature" else {}
+                                ),
+                            },
+                            "until": self.last_schedule_boundary or 0,
+                            "source": "external",
+                        }
+                        self.pending = None
+                        self.deferred = None
+                        await self.broadcast_status(
+                            metadata,
+                            client,
+                            expected_epoch=token.attachment_epoch,
+                            expected_token=token,
+                        )
+                        token.set()
+                        if self.apply_token is token:
+                            self.apply_token = None
                         superseded = True
                         break
                     except Exception:
@@ -1621,27 +1987,47 @@ class ControllerDaemon:
                 self.apply_token.set()
         return actual
 
+    async def _health_iteration(self) -> None:
+        epoch = self.active_attachment_epoch
+        token = self.apply_token
+        recovered = False
+        try:
+            actual = await self.observe(None, epoch, token)
+            if actual is None:
+                return
+            recovered = True
+        except Exception:
+            # A failed probe from superseded authority must not downgrade
+            # the replacement's backend state either.
+            if not self.observation_is_current(None, epoch, token):
+                return
+            self.backend_ready = False
+            self.backend_error = "backend-unavailable"
+        # Publication is part of the health observation transaction. Bind it
+        # to the exact captured apply authority, including None: a health status
+        # blocked in output must not consume an ack created later.
+        await self.broadcast_status(expected_epoch=epoch, expected_token=token)
+        if recovered and self.deferred is not None and self.pending is None and self.runtime_override is None:
+            # Publish health first. The attached Service immediately sends its
+            # freshly recalculated (possibly newly persisted) target, replacing
+            # deferred work. Retain a bounded fallback for other protocol
+            # callers so deferred health recovery is not weakened.
+            deferred = self.deferred
+            await asyncio.sleep(0.1)
+            if (
+                self.deferred is deferred
+                and self.pending is None
+                and self.runtime_override is None
+                and self.observation_is_current(None, epoch, token)
+            ):
+                self.pending = deferred
+                self.deferred = None
+                self.apply_event.set()
+
     async def health_loop(self) -> None:
         while True:
             await asyncio.sleep(30)
-            epoch = self.active_attachment_epoch
-            token = self.apply_token
-            try:
-                actual = await self.observe(None, epoch, token)
-                if actual is None:
-                    continue
-                if self.deferred is not None and self.pending is None and self.runtime_override is None:
-                    self.pending = self.deferred
-                    self.deferred = None
-                    self.apply_event.set()
-            except Exception:
-                # A failed probe from superseded authority must not downgrade
-                # the replacement's backend state either.
-                if not self.observation_is_current(None, epoch, token):
-                    continue
-                self.backend_ready = False
-                self.backend_error = "backend-unavailable"
-            await self.broadcast_status(expected_epoch=epoch)
+            await self._health_iteration()
 
     async def close(self) -> None:
         # Stop admission first.  An apply already past its final token check is

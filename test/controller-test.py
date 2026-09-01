@@ -594,8 +594,67 @@ class RecordingClient:
         self.tasks = {}
 
     async def send(self, value, *, guard=None):
-        if guard is None or guard():
-            self.messages.append(value)
+        if guard is not None and not guard():
+            return False
+        self.messages.append(value)
+        return True
+
+
+class MemoryStreamWriter:
+    """Small StreamWriter duck used to exercise the real Client output lock."""
+
+    def __init__(self):
+        self.data = []
+        self.closing = False
+
+    def is_closing(self):
+        return self.closing
+
+    def write(self, data):
+        self.data.append(bytes(data))
+
+    async def drain(self):
+        await asyncio.sleep(0)
+
+    def messages(self):
+        return [json.loads(chunk) for chunk in self.data]
+
+
+class GatedDrainStreamWriter(MemoryStreamWriter):
+    """Buffers the first write, then holds its drain completion on a gate."""
+
+    def __init__(self):
+        super().__init__()
+        self.drain_entered = asyncio.Event()
+        self.drain_gate = asyncio.Event()
+        self._held_once = False
+
+    async def drain(self):
+        if not self._held_once:
+            self._held_once = True
+            self.drain_entered.set()
+            await self.drain_gate.wait()
+        else:
+            await asyncio.sleep(0)
+
+
+class TwoStageGatedDrainStreamWriter(MemoryStreamWriter):
+    """Independently gates health and generation-1 drain completion."""
+
+    def __init__(self):
+        super().__init__()
+        self.drain_entered = [asyncio.Event(), asyncio.Event()]
+        self.drain_gates = [asyncio.Event(), asyncio.Event()]
+        self.drain_count = 0
+
+    async def drain(self):
+        index = self.drain_count
+        self.drain_count += 1
+        if index < len(self.drain_gates):
+            self.drain_entered[index].set()
+            await self.drain_gates[index].wait()
+        else:
+            await asyncio.sleep(0)
 
 
 class SlowBackend:
@@ -677,6 +736,7 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
                             "protocol": 1, "requestId": "old-temperature", "generation": 1,
                             "operation": "setDesired",
                             "desired": {"kind": "temperature", "temperature": 4100},
+                            "ifActual": {"kind": "temperature", "temperature": 4777},
                             "intent": "schedule",
                         })
                         old_token = daemon.apply_token
@@ -686,6 +746,7 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
                             "protocol": 1, "requestId": "new-temperature", "generation": 2,
                             "operation": "setDesired",
                             "desired": {"kind": "temperature", "temperature": 4300},
+                            "ifActual": {"kind": "temperature", "temperature": 4777},
                             "intent": "schedule",
                         })
                         await self.wait_until(
@@ -707,12 +768,14 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
                             "protocol": 1, "requestId": "old-again", "generation": 3,
                             "operation": "setDesired",
                             "desired": {"kind": "temperature", "temperature": 4200},
+                            "ifActual": {"kind": "temperature", "temperature": 4300},
                             "intent": "schedule",
                         })
                         await self.wait_until(lambda: daemon.pending is None)
                         await daemon.dispatch(client, {
                             "protocol": 1, "requestId": "identity", "generation": 4,
                             "operation": "setDesired", "desired": {"kind": "identity"},
+                            "ifActual": {"kind": "temperature", "temperature": 4300},
                             "intent": "schedule",
                         })
                         await self.wait_until(
@@ -728,6 +791,427 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
                     daemon.apply_task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await daemon.apply_task
+
+    async def test_stale_status_held_on_output_lock_preserves_successor_ack_chain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            with mock.patch.dict(os.environ, fake.environment(), clear=False), \
+                    mock.patch.object(controller, "TEMPERATURE_WRITE_INTERVAL", 0.0):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = controller.Backend()
+                await daemon.backend.probe()
+                daemon.backend_ready = True
+                writer = MemoryStreamWriter()
+                client = controller.Client(asyncio.StreamReader(), writer)
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                await client.write_lock.acquire()
+                try:
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "old", "generation": 1,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4300},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    old_token = daemon.apply_token
+                    self.assertIsNotNone(old_token)
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4300}
+                    )
+                    self.assertTrue(
+                        daemon.backend.last_ack_chain_available,
+                        "verified old ack was consumed before output publication",
+                    )
+
+                    # Service cannot have observed old: its status is waiting on
+                    # write_lock. The rapid successor therefore truthfully keeps
+                    # the previously published 4777 K as its CAS guard.
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "new", "generation": 2,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4100},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    self.assertTrue(old_token.is_set())
+                finally:
+                    client.write_lock.release()
+
+                try:
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4100}
+                    )
+                    await self.wait_until(lambda: len(writer.messages()) == 1)
+                    self.assertEqual(fake.writes(), [
+                        ["hyprsunset", "temperature", "4300"],
+                        ["hyprsunset", "temperature", "4100"],
+                    ])
+                    self.assertIsNone(daemon.runtime_override)
+                    wire = writer.messages()
+                    self.assertEqual(len(wire), 1, "stale old status reached the wire")
+                    self.assertEqual(wire[0]["requestId"], "new")
+                    self.assertEqual(wire[0]["generation"], 2)
+                    self.assertEqual(wire[0]["actual"], {
+                        "kind": "temperature", "temperature": 4100, "gamma": 100,
+                    })
+                    self.assertFalse(
+                        daemon.backend.last_ack_chain_available,
+                        "successfully published successor status retained private ack allowance",
+                    )
+                finally:
+                    daemon.apply_task.cancel()
+                    await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_supersession_during_drain_preserves_successor_ack_chain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            with mock.patch.dict(os.environ, fake.environment(), clear=False), \
+                    mock.patch.object(controller, "TEMPERATURE_WRITE_INTERVAL", 0.0):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = controller.Backend()
+                await daemon.backend.probe()
+                daemon.backend_ready = True
+                writer = GatedDrainStreamWriter()
+                client = controller.Client(asyncio.StreamReader(), writer)
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                try:
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "old-drain", "generation": 1,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4300},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    old_token = daemon.apply_token
+                    self.assertIsNotNone(old_token)
+                    await asyncio.wait_for(writer.drain_entered.wait(), 1)
+                    self.assertEqual(
+                        daemon.backend.last_ack,
+                        {"kind": "temperature", "temperature": 4300},
+                    )
+                    self.assertTrue(daemon.backend.last_ack_chain_available)
+                    self.assertEqual(
+                        [message["requestId"] for message in writer.messages()],
+                        ["old-drain"],
+                        "old status was not buffered before drain blocked",
+                    )
+
+                    # The pre-drain guard passed, but this successor revokes the
+                    # old token before drain completion. Service still holds its
+                    # last accepted 4777 K because generation 1 is now stale.
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "new-drain", "generation": 2,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4100},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    self.assertTrue(old_token.is_set())
+                    writer.drain_gate.set()
+
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4100}
+                    )
+                    await self.wait_until(lambda: len(writer.messages()) == 2)
+                    self.assertEqual(fake.writes(), [
+                        ["hyprsunset", "temperature", "4300"],
+                        ["hyprsunset", "temperature", "4100"],
+                    ])
+                    self.assertIsNone(daemon.runtime_override)
+                    wire = writer.messages()
+                    # writer.write necessarily buffered old bytes before the
+                    # gated drain. Their stale correlation makes them
+                    # non-authoritative; only generation 2 carries latest state.
+                    self.assertEqual(
+                        [(row["requestId"], row["generation"]) for row in wire],
+                        [("old-drain", 1), ("new-drain", 2)],
+                    )
+                    self.assertEqual(wire[1]["actual"], {
+                        "kind": "temperature", "temperature": 4100, "gamma": 100,
+                    })
+                    self.assertFalse(daemon.backend.last_ack_chain_available)
+                finally:
+                    writer.drain_gate.set()
+                    daemon.apply_task.cancel()
+                    await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_two_stage_health_drain_cannot_consume_newer_ack_chain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            with mock.patch.dict(os.environ, fake.environment(), clear=False), \
+                    mock.patch.object(controller, "TEMPERATURE_WRITE_INTERVAL", 0.0):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = controller.Backend()
+                await daemon.backend.probe()
+                daemon.backend_ready = True
+                writer = TwoStageGatedDrainStreamWriter()
+                client = controller.Client(asyncio.StreamReader(), writer)
+                session = daemon.activate_client(client)
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                captured_token = daemon.apply_token
+                self.assertIsNone(captured_token)
+                health = asyncio.create_task(daemon._health_iteration())
+                try:
+                    # Health has buffered the initial 4777 K observation, but
+                    # its first drain is still incomplete under captured None
+                    # apply authority.
+                    await asyncio.wait_for(writer.drain_entered[0].wait(), 1)
+                    self.assertEqual(writer.messages()[0]["actual"], {
+                        "kind": "temperature", "temperature": 4777, "gamma": 100,
+                    })
+
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "health-g1", "generation": 1,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4300},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    g1_token = daemon.apply_token
+                    self.assertIsNotNone(g1_token)
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4300}
+                    )
+                    self.assertTrue(daemon.backend.last_ack_chain_available)
+
+                    # Completing old health drain must fail its captured-None
+                    # guard rather than erase generation 1's newer ack chain.
+                    writer.drain_gates[0].set()
+                    await asyncio.wait_for(health, 1)
+                    await asyncio.wait_for(writer.drain_entered[1].wait(), 1)
+                    self.assertTrue(
+                        daemon.backend.last_ack_chain_available,
+                        "older health publication consumed generation 1 ack",
+                    )
+
+                    # Generation 1 is now buffered in the second gated drain.
+                    # Generation 2 still truthfully guards from Service's last
+                    # canonical 4777 K because g1 correlation is obsolete.
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "health-g2", "generation": 2,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4100},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    self.assertTrue(g1_token.is_set())
+                    writer.drain_gates[1].set()
+
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4100}
+                    )
+                    await self.wait_until(lambda: len(writer.messages()) == 3)
+                    self.assertEqual(fake.writes(), [
+                        ["hyprsunset", "temperature", "4300"],
+                        ["hyprsunset", "temperature", "4100"],
+                    ])
+                    self.assertIsNone(daemon.runtime_override)
+                    wire = writer.messages()
+                    self.assertEqual(
+                        [(row.get("requestId"), row.get("generation")) for row in wire],
+                        [(None, None), ("health-g1", 1), ("health-g2", 2)],
+                    )
+                    self.assertEqual(wire[2]["actual"], {
+                        "kind": "temperature", "temperature": 4100, "gamma": 100,
+                    })
+                    self.assertFalse(daemon.backend.last_ack_chain_available)
+
+                    # A health publication captured under unchanged g2 authority
+                    # remains legitimate and reaches the same client.
+                    await daemon._health_iteration()
+                    self.assertEqual(len(writer.messages()), 4)
+                    self.assertEqual(writer.messages()[3]["actual"], {
+                        "kind": "temperature", "temperature": 4100, "gamma": 100,
+                    })
+                finally:
+                    for gate in writer.drain_gates:
+                        gate.set()
+                    if not health.done():
+                        health.cancel()
+                        await asyncio.gather(health, return_exceptions=True)
+                    daemon.apply_task.cancel()
+                    await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_health_after_g1_admission_cannot_consume_post_probe_ack_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            with mock.patch.dict(os.environ, fake.environment(), clear=False), \
+                    mock.patch.object(controller, "TEMPERATURE_WRITE_INTERVAL", 0.0):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = controller.Backend()
+                await daemon.backend.probe()
+                daemon.backend_ready = True
+                writer = TwoStageGatedDrainStreamWriter()
+                client = controller.Client(asyncio.StreamReader(), writer)
+                daemon.activate_client(client)
+
+                # Admit g1 but do not start apply_loop yet. Health therefore
+                # observes 4777 K under the same token g1 will later mutate.
+                await daemon.dispatch(client, {
+                    "protocol": 1, "requestId": "same-token-g1", "generation": 1,
+                    "operation": "setDesired",
+                    "desired": {"kind": "temperature", "temperature": 4300},
+                    "ifActual": {"kind": "temperature", "temperature": 4777},
+                    "intent": "schedule", "overrideUntil": 999999,
+                })
+                g1_token = daemon.apply_token
+                self.assertIsNotNone(g1_token)
+                health = asyncio.create_task(daemon._health_iteration())
+                daemon.apply_task = None
+                try:
+                    await asyncio.wait_for(writer.drain_entered[0].wait(), 1)
+                    self.assertEqual(writer.messages()[0]["actual"], {
+                        "kind": "temperature", "temperature": 4777, "gamma": 100,
+                    })
+                    observed_version = daemon.backend.last_ack_chain_version
+                    self.assertEqual(observed_version, 0)
+
+                    # g1 mutates only after health's status/version snapshot.
+                    daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4300}
+                    )
+                    self.assertGreater(
+                        daemon.backend.last_ack_chain_version, observed_version
+                    )
+                    g1_ack_version = daemon.backend.last_ack_chain_version
+                    self.assertTrue(daemon.backend.last_ack_chain_available)
+
+                    # Health still has the same token and legitimately reaches
+                    # the wire, but its old version must not consume g1's ack.
+                    writer.drain_gates[0].set()
+                    await asyncio.wait_for(health, 1)
+                    await asyncio.wait_for(writer.drain_entered[1].wait(), 1)
+                    self.assertEqual(
+                        daemon.backend.last_ack_chain_version, g1_ack_version
+                    )
+                    self.assertTrue(
+                        daemon.backend.last_ack_chain_available,
+                        "same-token pre-mutation health consumed post-probe g1 ack",
+                    )
+
+                    # g1 response is now in the second drain. Supersede it with
+                    # g2 while Service still truthfully guards from 4777 K.
+                    await daemon.dispatch(client, {
+                        "protocol": 1, "requestId": "same-token-g2", "generation": 2,
+                        "operation": "setDesired",
+                        "desired": {"kind": "temperature", "temperature": 4100},
+                        "ifActual": {"kind": "temperature", "temperature": 4777},
+                        "intent": "schedule", "overrideUntil": 999999,
+                    })
+                    self.assertTrue(g1_token.is_set())
+                    writer.drain_gates[1].set()
+
+                    await self.wait_until(
+                        lambda: daemon.backend.last_ack
+                        == {"kind": "temperature", "temperature": 4100}
+                    )
+                    await self.wait_until(lambda: len(writer.messages()) == 3)
+                    self.assertEqual(fake.writes(), [
+                        ["hyprsunset", "temperature", "4300"],
+                        ["hyprsunset", "temperature", "4100"],
+                    ])
+                    self.assertIsNone(daemon.runtime_override)
+                    wire = writer.messages()
+                    self.assertEqual(
+                        [(row.get("requestId"), row.get("generation")) for row in wire],
+                        [(None, None), ("same-token-g1", 1), ("same-token-g2", 2)],
+                    )
+                    self.assertEqual(wire[2]["actual"], {
+                        "kind": "temperature", "temperature": 4100, "gamma": 100,
+                    })
+                    self.assertGreater(
+                        daemon.backend.last_ack_chain_version, g1_ack_version
+                    )
+                    self.assertFalse(daemon.backend.last_ack_chain_available)
+                finally:
+                    for gate in writer.drain_gates:
+                        gate.set()
+                    if not health.done():
+                        health.cancel()
+                        await asyncio.gather(health, return_exceptions=True)
+                    if daemon.apply_task is not None:
+                        daemon.apply_task.cancel()
+                        await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_schedule_cas_adopts_external_state_without_a_plugin_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake = FakeHyprctl(root)
+            with mock.patch.dict(os.environ, fake.environment(), clear=False):
+                daemon = controller.ControllerDaemon(root)
+                daemon.backend = controller.Backend()
+                await daemon.backend.probe()
+                daemon.backend_ready = True
+                client = RecordingClient()
+
+                await daemon.dispatch(client, {
+                    "protocol": 1, "requestId": "cas", "generation": 1,
+                    "operation": "setDesired",
+                    "desired": {"kind": "temperature", "temperature": 4100},
+                    "ifActual": {"kind": "temperature", "temperature": 4777},
+                    "intent": "schedule", "overrideUntil": 987654,
+                })
+                token = daemon.apply_token
+                self.assertIsNotNone(token)
+
+                # The external winner deliberately equals stale plugin history;
+                # an arbitrary old ack is not ownership proof for this CAS.
+                daemon.backend.last_ack = {"kind": "temperature", "temperature": 3333}
+                daemon.backend.last_ack_owner = (token.attachment_epoch, 0)
+                daemon.backend.last_ack_chain_available = False
+                fake.state.write_text(json.dumps({
+                    "identity": False, "temperature": 3333, "gamma": 100,
+                }))
+
+                daemon.apply_task = asyncio.create_task(daemon.apply_loop())
+                try:
+                    await self.wait_until(lambda: any(
+                        message.get("requestId") == "cas"
+                        and message.get("type") == "backendStatus"
+                        for message in client.messages
+                    ))
+                    response = next(
+                        message for message in client.messages
+                        if message.get("requestId") == "cas"
+                    )
+                    self.assertEqual(response["actual"], {
+                        "kind": "temperature", "temperature": 3333, "gamma": 100,
+                    })
+                    self.assertEqual(response["override"], {
+                        "target": {"kind": "temperature", "temperature": 3333},
+                        "until": 987654, "source": "external",
+                    })
+                    self.assertEqual(fake.writes(), [])
+                    self.assertIsNone(daemon.pending)
+                    self.assertIsNone(daemon.deferred)
+                    self.assertTrue(token.is_set())
+                finally:
+                    daemon.apply_task.cancel()
+                    await asyncio.gather(daemon.apply_task, return_exceptions=True)
+
+    async def test_invalid_schedule_cas_value_is_rejected_before_queueing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            client = RecordingClient()
+            await daemon.dispatch(client, {
+                "protocol": 1, "requestId": "bad-cas", "generation": 1,
+                "operation": "setDesired", "desired": {"kind": "identity"},
+                "ifActual": {"kind": "temperature", "temperature": 999},
+                "intent": "schedule",
+            })
+            self.assertEqual(client.messages[-1]["code"], "invalid-request")
+            self.assertIsNone(daemon.pending)
 
     async def test_matching_override_and_resume_keep_semantics_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1179,6 +1663,310 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.1)
             published = [message.get("requestId") for message in client.messages if message.get("type") == "networkResult"]
             self.assertEqual(published, ["new"])
+
+
+class CivilProjectionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def epoch_ms(value):
+        parsed = controller.dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000)
+
+    @staticmethod
+    def request(**changes):
+        request = {
+            "protocol": 1,
+            "requestId": "timeline-1",
+            "generation": 1,
+            "operation": "projectCivilDay",
+            "nowMs": 1788273420000,
+            "zoneId": "Europe/Amsterdam",
+            "events": [{"kind": "sunrise", "epochMs": 1788238305216}],
+            "displayTimes": {"sunset": 1788287423925},
+        }
+        request.update(changes)
+        return request
+
+    async def test_reference_projection_echoes_transaction_and_filters_by_civil_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            client = RecordingClient()
+            request = self.request(events=[
+                {"kind": "sunset", "epochMs": self.epoch_ms("2026-08-31T18:30:00Z")},
+                {"kind": "sunrise", "epochMs": 1788238305216},
+                {"kind": "sunset", "epochMs": 1788287423925},
+                {"kind": "sunrise", "epochMs": self.epoch_ms("2026-09-02T04:53:00Z")},
+            ], displayTimes={
+                "sunset": 1788287423925,
+                "sunrise": 1788238305216,
+                "nextBoundary": None,
+                "overrideUntil": self.epoch_ms("2026-09-02T04:53:00Z"),
+            })
+            await daemon.dispatch(client, request)
+
+        self.assertEqual(len(client.messages), 1)
+        response = client.messages[0]
+        self.assertEqual(response["type"], "civilDay")
+        self.assertEqual(response["requestId"], "timeline-1")
+        self.assertEqual(response["generation"], 1)
+        projection = response["projection"]
+        self.assertEqual(projection["dateKey"], "2026-09-01")
+        self.assertEqual(projection["zoneId"], "Europe/Amsterdam")
+        self.assertEqual(projection["zoneSource"], "location")
+        self.assertEqual(projection["dayStartMs"], 1788213600000)
+        self.assertEqual(projection["dayEndMs"], 1788300000000)
+        self.assertEqual(projection["markerWallMs"], 59820000)
+        self.assertEqual(projection["markerOffsetMinutes"], 120)
+        self.assertEqual(projection["markerFold"], 0)
+        self.assertFalse(projection["markerAmbiguous"])
+        self.assertEqual([event["kind"] for event in projection["events"]], ["sunrise", "sunset"])
+        self.assertEqual(projection["events"][0], {
+            "kind": "sunrise", "epochMs": 1788238305216,
+            "dateKey": "2026-09-01", "wallMs": 24705216,
+            "offsetMinutes": 120, "fold": 0, "ambiguous": False,
+        })
+        self.assertIsNone(projection["displayTimes"]["nextBoundary"])
+        self.assertEqual(
+            projection["displayTimes"]["overrideUntil"]["dateKey"], "2026-09-02"
+        )
+
+    async def test_spring_gap_has_real_23_hour_bounds_and_snapped_wall_time(self):
+        now_ms = self.epoch_ms("2026-03-29T01:30:00Z")
+        projection = controller.project_civil_day(self.request(
+            nowMs=now_ms,
+            events=[{"kind": "sunrise", "epochMs": now_ms}],
+            displayTimes={},
+        ))
+        self.assertEqual(projection["dateKey"], "2026-03-29")
+        self.assertEqual(projection["dayEndMs"] - projection["dayStartMs"], 23 * 60 * 60 * 1000)
+        self.assertEqual(projection["markerWallMs"], 3 * 60 * 60 * 1000 + 30 * 60 * 1000)
+        self.assertEqual(projection["markerOffsetMinutes"], 120)
+        self.assertEqual(projection["markerFold"], 0)
+        self.assertFalse(projection["markerAmbiguous"])
+
+    async def test_fall_fold_has_real_25_hour_bounds_and_distinct_same_wall_events(self):
+        first = self.epoch_ms("2026-10-25T00:30:00Z")
+        second = self.epoch_ms("2026-10-25T01:30:00Z")
+        projection = controller.project_civil_day(self.request(
+            nowMs=second,
+            events=[
+                {"kind": "sunrise", "epochMs": first},
+                {"kind": "sunset", "epochMs": second},
+            ],
+            displayTimes={"sunrise": first, "sunset": second},
+        ))
+        self.assertEqual(projection["dayEndMs"] - projection["dayStartMs"], 25 * 60 * 60 * 1000)
+        self.assertEqual(projection["markerWallMs"], 2 * 60 * 60 * 1000 + 30 * 60 * 1000)
+        self.assertEqual((projection["markerOffsetMinutes"], projection["markerFold"]), (60, 1))
+        self.assertTrue(projection["markerAmbiguous"])
+        events = projection["events"]
+        self.assertEqual([event["wallMs"] for event in events], [9_000_000, 9_000_000])
+        self.assertEqual([event["offsetMinutes"] for event in events], [120, 60])
+        self.assertEqual([event["fold"] for event in events], [0, 1])
+        self.assertTrue(all(event["ambiguous"] for event in events))
+
+    async def test_invalid_location_zone_uses_live_system_iana_zone(self):
+        now_ms = self.epoch_ms("2026-01-15T12:00:00Z")
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}, clear=False):
+            projection = controller.project_civil_day(self.request(
+                nowMs=now_ms, zoneId="Not/A_Zone", events=[], displayTimes={}
+            ))
+        self.assertEqual(projection["zoneId"], "America/New_York")
+        self.assertEqual(projection["zoneSource"], "system")
+        self.assertEqual(projection["dateKey"], "2026-01-15")
+        self.assertEqual(projection["markerWallMs"], 7 * 60 * 60 * 1000)
+        self.assertEqual(projection["markerOffsetMinutes"], -300)
+
+    async def test_polar_empty_and_single_event_shapes_are_not_fabricated(self):
+        empty = controller.project_civil_day(self.request(events=[], displayTimes={}))
+        self.assertEqual(empty["events"], [])
+        self.assertEqual(empty["displayTimes"], {})
+
+        event_ms = self.epoch_ms("2026-09-01T21:59:59.999Z")
+        single = controller.project_civil_day(self.request(
+            events=[{"kind": "sunset", "epochMs": event_ms}], displayTimes={}
+        ))
+        self.assertEqual(len(single["events"]), 1)
+        self.assertEqual(single["events"][0]["kind"], "sunset")
+        self.assertEqual(single["events"][0]["wallMs"], 86_399_999)
+
+    async def test_request_bounds_and_named_fields_reject_without_partial_projection(self):
+        invalid_requests = [
+            self.request(nowMs=True),
+            self.request(nowMs=controller.ECMASCRIPT_DATE_LIMIT_MS),
+            self.request(zoneId="x" * 81),
+            self.request(events=[{"kind": "sunrise", "epochMs": 1788238305216}] * 9),
+            self.request(events=[{"kind": "noon", "epochMs": 1788238305216}]),
+            self.request(events=[{"kind": "sunrise", "epochMs": float("nan")}]),
+            self.request(displayTimes={"sunrise": 1788238305216, "private": 0}),
+            self.request(displayTimes={"sunrise": "1788238305216"}),
+        ]
+        for index, request in enumerate(invalid_requests):
+            with self.subTest(index=index):
+                with tempfile.TemporaryDirectory() as temporary:
+                    daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+                    client = RecordingClient()
+                    await daemon.dispatch(client, request)
+                self.assertEqual(len(client.messages), 1)
+                self.assertEqual(client.messages[0]["type"], "error")
+                self.assertEqual(client.messages[0]["code"], "invalid-request")
+                self.assertNotIn("projection", client.messages[0])
+
+        accepted = controller.project_civil_day(self.request(
+            events=[
+                {"kind": "sunrise" if index % 2 == 0 else "sunset", "epochMs": 1788238305216 + index}
+                for index in range(8)
+            ],
+            displayTimes={},
+        ))
+        self.assertEqual(len(accepted["events"]), 8)
+
+    async def test_projection_has_no_location_network_backend_or_override_side_effect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            daemon.runtime_override = {
+                "target": {"kind": "temperature", "temperature": 3333},
+                "until": 123, "source": "external",
+            }
+            client = RecordingClient()
+            with mock.patch.object(daemon.store, "read") as read, \
+                    mock.patch.object(daemon.store, "write") as write, \
+                    mock.patch.object(daemon.provider, "geocode") as geocode, \
+                    mock.patch.object(daemon.provider, "auto_locate") as auto_locate, \
+                    mock.patch.object(daemon.backend, "probe") as probe, \
+                    mock.patch.object(daemon.backend, "apply") as apply:
+                await daemon.dispatch(client, self.request(events=[], displayTimes={}))
+            for operation in (read, write, geocode, auto_locate, probe, apply):
+                operation.assert_not_called()
+            self.assertEqual(daemon.runtime_override["target"]["temperature"], 3333)
+            self.assertIsNone(daemon.pending)
+            self.assertIsNone(daemon.deferred)
+            self.assertEqual(client.messages[0]["type"], "civilDay")
+
+    async def test_latest_timeline_generation_and_attachment_are_publication_barriers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            old_client = RecordingClient()
+            entered = threading.Event()
+            gate = threading.Event()
+            real_project = controller.project_civil_day
+
+            def delayed(request):
+                if request["requestId"] in ("old-generation", "old-attachment"):
+                    entered.set()
+                    gate.wait(1)
+                return real_project(request)
+
+            with mock.patch.object(controller, "project_civil_day", side_effect=delayed):
+                old = asyncio.create_task(daemon.dispatch(old_client, self.request(
+                    requestId="old-generation", generation=1, events=[], displayTimes={}
+                )))
+                await asyncio.wait_for(asyncio.to_thread(entered.wait), 1)
+                # Even a deliberately reused generation is latest-request-wins.
+                await daemon.dispatch(old_client, self.request(
+                    requestId="new-generation", generation=1, events=[], displayTimes={}
+                ))
+                gate.set()
+                await asyncio.wait_for(old, 1)
+            self.assertEqual(
+                [message.get("requestId") for message in old_client.messages],
+                ["new-generation"],
+            )
+
+            entered.clear()
+            gate.clear()
+            fresh_client = RecordingClient()
+            with mock.patch.object(controller, "project_civil_day", side_effect=delayed):
+                old = asyncio.create_task(daemon.dispatch(old_client, self.request(
+                    requestId="old-attachment", generation=3, events=[], displayTimes={}
+                )))
+                await asyncio.wait_for(asyncio.to_thread(entered.wait), 1)
+                await daemon.dispatch(fresh_client, self.request(
+                    requestId="fresh-attachment", generation=0, events=[], displayTimes={}
+                ))
+                gate.set()
+                await asyncio.wait_for(old, 1)
+            self.assertFalse(any(
+                message.get("requestId") == "old-attachment" for message in old_client.messages
+            ))
+            self.assertEqual(fresh_client.messages[0]["requestId"], "fresh-attachment")
+
+    async def test_real_unix_socket_new_projection_revokes_blocked_same_attachment_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            daemon = controller.ControllerDaemon(root)
+            daemon.socket_path = root / "projection.sock"
+            daemon.server = await asyncio.start_unix_server(
+                daemon.handle_client, path=daemon.socket_path
+            )
+            reader, writer = await asyncio.open_unix_connection(daemon.socket_path)
+            entered = threading.Event()
+            gate = threading.Event()
+            old_finished = threading.Event()
+            real_project = controller.project_civil_day
+
+            def delayed(request):
+                if request["requestId"] == "socket-old":
+                    entered.set()
+                    try:
+                        gate.wait(2)
+                    finally:
+                        old_finished.set()
+                return real_project(request)
+
+            try:
+                ready = json.loads(await asyncio.wait_for(reader.readline(), 1))
+                status = json.loads(await asyncio.wait_for(reader.readline(), 1))
+                self.assertEqual(ready["type"], "ready")
+                self.assertEqual(status["type"], "backendStatus")
+
+                old_request = self.request(
+                    requestId="socket-old", generation=1,
+                    zoneId="Europe/Amsterdam", events=[], displayTimes={},
+                )
+                new_request = self.request(
+                    requestId="socket-new", generation=2,
+                    zoneId="Asia/Tokyo", events=[], displayTimes={},
+                )
+                with mock.patch.object(
+                    controller, "project_civil_day", side_effect=delayed
+                ):
+                    writer.write((json.dumps(old_request) + "\n").encode())
+                    await writer.drain()
+                    await asyncio.wait_for(asyncio.to_thread(entered.wait), 1)
+
+                    # This is one real attachment and one sequential NDJSON
+                    # stream.  The reader must admit generation 2 while the
+                    # generation-1 worker remains blocked.
+                    writer.write((json.dumps(new_request) + "\n").encode())
+                    await writer.drain()
+                    response = json.loads(await asyncio.wait_for(reader.readline(), 1))
+                    self.assertEqual(response["type"], "civilDay")
+                    self.assertEqual(response["requestId"], "socket-new")
+                    self.assertEqual(response["generation"], 2)
+                    self.assertEqual(response["projection"]["zoneId"], "Asia/Tokyo")
+
+                    gate.set()
+                    await asyncio.wait_for(asyncio.to_thread(old_finished.wait), 1)
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await asyncio.wait_for(reader.readline(), 0.1)
+            finally:
+                gate.set()
+                daemon.closing = True
+                writer.close()
+                await writer.wait_closed()
+                daemon.server.close()
+                await daemon.server.wait_closed()
+
+                async def clients_closed():
+                    while daemon.clients:
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(clients_closed(), 1)
+                if daemon.release_task is not None:
+                    daemon.release_task.cancel()
+                    await asyncio.gather(daemon.release_task, return_exceptions=True)
+                with contextlib.suppress(FileNotFoundError):
+                    daemon.socket_path.unlink()
 
 
 class AttachDaemonTests(unittest.TestCase):

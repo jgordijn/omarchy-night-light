@@ -8,15 +8,17 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/qml" "$TMP/state/omarchy/settings" "$TMP/runtime"
 chmod 700 "$TMP/runtime"
-cp "$ROOT/Service.qml" "$ROOT/SolarModel.js" "$ROOT/ScheduleModel.js" "$ROOT/LocationModel.js" "$TMP/qml/"
+cp "$ROOT/Service.qml" "$ROOT/SolarModel.js" "$ROOT/ScheduleModel.js" "$ROOT/LocationModel.js" \
+  "$ROOT/TimelineModel.js" "$ROOT/MoonModel.js" "$TMP/qml/"
 
-# Put the test location near solar noon so the scheduled target is
-# deterministically identity regardless of the CI runner's wall-clock hour.
-python - "$TMP/state/omarchy/settings/weather.json" "$TMP/private-state.json" <<'PY'
-import datetime, json, pathlib, sys
-now = datetime.datetime.now(datetime.timezone.utc)
-hours = now.hour + now.minute / 60 + now.second / 3600
-longitude = ((15 * (12 - hours) + 180) % 360) - 180
+# Generate one model-verified solar-noon longitude shared by Weather and every
+# manual coordinate committed later in this race harness. The helper also
+# checks representative seasons/UTC hours, while this fixture uses live now.
+FIXTURE_JSON=$(node "$ROOT/test/solar-noon-fixture.cjs")
+DAY_LONGITUDE=$(python -c 'import json,sys; print(json.load(sys.stdin)["longitude"])' <<<"$FIXTURE_JSON")
+python - "$TMP/state/omarchy/settings/weather.json" "$TMP/private-state.json" "$DAY_LONGITUDE" <<'PY'
+import json, pathlib, sys
+longitude = float(sys.argv[3])
 weather = {"name": "Test Weather", "latitude": 0, "longitude": longitude}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(weather))
 pathlib.Path(sys.argv[2]).write_text(json.dumps({
@@ -116,6 +118,8 @@ import "."
 ShellRoot {
   id: harness
   property bool failed: false
+  readonly property real dayLongitude: Number(Quickshell.env("FAKE_DAY_LONGITUDE"))
+  function manualCoordinates(latitude) { return String(latitude) + ", " + String(dayLongitude) }
   property QtObject fakeShell: QtObject {
     property var shellConfig: ({
       version: 1,
@@ -246,7 +250,7 @@ ShellRoot {
       if (stage === 5 && service && service._initializationInFlight && service._stateBusy) {
         stage = 6
         ticks = 0
-        if (!service.useManualCoordinates("10, 20") || !service._queuedStateWrite) {
+        if (!service.useManualCoordinates(harness.manualCoordinates(10)) || !service._queuedStateWrite) {
           console.error("SERVICE_TEST_FAIL manual B was not queued")
           Qt.quit()
         }
@@ -266,7 +270,7 @@ ShellRoot {
           service.privateLocationState && service.privateLocationState.mode === "manual" &&
           service.activeScheduleLocation && service.activeScheduleLocation.source === "manual-coordinates" &&
           Number(service.activeScheduleLocation.latitude) === 10 &&
-          Number(service.activeScheduleLocation.longitude) === 20
+          Math.abs(Number(service.activeScheduleLocation.longitude) - harness.dayLongitude) < 0.000000001
         if (manualCommitted) {
           // Restore a stale Weather state without resetting the write-failure
           // marker. Startup Weather A will now succeed while manual B queues.
@@ -279,7 +283,7 @@ ShellRoot {
       if (stage === 8 && service && service._initializationInFlight && service._stateBusy) {
         stage = 9
         ticks = 0
-        if (!service.useManualCoordinates("30, 40") || !service._queuedStateWrite) {
+        if (!service.useManualCoordinates(harness.manualCoordinates(30)) || !service._queuedStateWrite) {
           console.error("SERVICE_TEST_FAIL success-path manual B was not queued")
           Qt.quit()
         }
@@ -295,7 +299,7 @@ ShellRoot {
           Number(service.privateLocationState.weatherCache.latitude) === 0 &&
           service.activeScheduleLocation && service.activeScheduleLocation.source === "manual-coordinates" &&
           Number(service.activeScheduleLocation.latitude) === 30 &&
-          Number(service.activeScheduleLocation.longitude) === 40
+          Math.abs(Number(service.activeScheduleLocation.longitude) - harness.dayLongitude) < 0.000000001
         if (successRebaseCommitted) {
           console.log("SERVICE_TEST_PASS", JSON.stringify(service.statusObject()))
           Qt.quit()
@@ -320,6 +324,7 @@ timeout 12s env \
   FAKE_CONTROLLER_LOG="$TMP/controller.log" \
   FAKE_PRIVATE_STATE="$TMP/private-state.json" \
   FAKE_WRITE_FAIL_MARKER="$TMP/write-failed-once" \
+  FAKE_DAY_LONGITUDE="$DAY_LONGITUDE" \
   QT_QPA_PLATFORM=offscreen \
   quickshell --no-color -p "$TMP/qml/shell.qml" >"$OUTPUT" 2>&1
 RC=$?
@@ -340,9 +345,10 @@ if grep -Eiq 'SERVICE_TEST_FAIL|TypeError|ReferenceError|is not a type|Cannot as
   exit 1
 fi
 
-python - "$TMP/controller.log" <<'PY'
+python - "$TMP/controller.log" "$DAY_LONGITUDE" <<'PY'
 import json, pathlib, sys
 rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+day_longitude = float(sys.argv[2])
 ops = [row["operation"] for row in rows]
 # Cold startup and one hot reload have canonically equal Weather caches and
 # issue no private write. The third startup has a useful cache change: its first
@@ -366,14 +372,14 @@ assert all(row["state"]["weatherCache"]["latitude"] == 0 for row in writes[:3])
 assert [row["expectedRevision"] for row in writes] == [4, 4, 5, 5, 6, 7], writes
 assert writes[3]["state"]["revision"] == 5, writes[3]
 assert writes[3]["state"]["manual"]["latitude"] == 10, writes[3]
-assert writes[3]["state"]["manual"]["longitude"] == 20, writes[3]
+assert abs(writes[3]["state"]["manual"]["longitude"] - day_longitude) < 1e-9, writes[3]
 # The failed A path rebases B onto pre-A state; the successful A path rebases B
 # onto A's revision-7 Weather cache and preserves unrelated consent state.
 assert writes[3]["state"]["weatherCache"]["latitude"] == 20, writes[3]
 assert writes[4]["state"]["weatherCache"]["latitude"] == 0, writes[4]
 assert writes[5]["state"]["revision"] == 7, writes[5]
 assert writes[5]["state"]["manual"]["latitude"] == 30, writes[5]
-assert writes[5]["state"]["manual"]["longitude"] == 40, writes[5]
+assert abs(writes[5]["state"]["manual"]["longitude"] - day_longitude) < 1e-9, writes[5]
 assert writes[5]["state"]["weatherCache"]["latitude"] == 0, writes[5]
 assert writes[5]["state"]["autoConsentVersion"] == 1, writes[5]
 PY

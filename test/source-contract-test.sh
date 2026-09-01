@@ -5,6 +5,10 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 BAR="$ROOT/BarWidget.qml"
 PANEL="$ROOT/Panel.qml"
+TIMELINE="$ROOT/DaylightTimeline.qml"
+MOON_ICON="$ROOT/MoonPhaseIcon.qml"
+TIMELINE_MODEL="$ROOT/TimelineModel.js"
+MOON_MODEL="$ROOT/MoonModel.js"
 
 fail() {
   printf 'source-contract-test: FAIL: %s\n' "$*" >&2
@@ -22,6 +26,9 @@ reject_text() {
 }
 
 [[ -f $BAR && -f $PANEL ]] || fail "BarWidget.qml and Panel.qml are required"
+for artifact in "$TIMELINE" "$MOON_ICON" "$TIMELINE_MODEL" "$MOON_MODEL"; do
+  [[ -f $artifact ]] || fail "Wave 3 package artifact is missing: $(basename "$artifact")"
+done
 
 require_text "$BAR" '^BarWidget[[:space:]]*\{' "BarWidget.qml must extend qs.Ui.BarWidget"
 require_text "$BAR" 'moduleName:[[:space:]]*"jgordijn\.night-light"' "bar widget must use the canonical module id"
@@ -70,6 +77,14 @@ require_text "$PANEL" 'Style\.' "panel must use scaled native geometry"
 require_text "$PANEL" 'updateEntryInline\(root\.moduleName, entry\)' "settings must persist through the shell inline-entry API"
 require_text "$PANEL" 'root\.hostWidget\.settings = entry' "settings must update the host immediately"
 require_text "$PANEL" 'root\.settings = entry' "settings must update visible controls immediately"
+require_text "$PANEL" 'service\.stepNightTemperature\(direction\)' "Warmth steps must use the sole Service writer"
+require_text "$PANEL" 'syncSettingsFromService\(\)' "successful Warmth steps must copy canonical Service settings immediately"
+require_text "$PANEL" 'Saved automatically · Live during automatic warmth' "Warmth persistence/live behavior copy is missing"
+reject_text "$PANEL" 'persistSettings\(\{[[:space:]]*nightTemperature:' "Panel must not persist Warmth directly"
+require_text "$PANEL" 'existing !== "nightTemperature"' "generic Panel persistence must not merge stale local Warmth"
+require_text "$PANEL" 'key !== "id" && key !== "nightTemperature"' "generic Panel changes must not write Warmth"
+require_text "$PANEL" 'canonicalTemperature = serviceEntry \? serviceEntry\.nightTemperature' "generic Panel persistence must restore canonical Service Warmth"
+reject_text "$PANEL" 'entry\.nightTemperature[[:space:]]*=[[:space:]]*root\.settings' "Panel must never source a Warmth write from local settings"
 require_text "$PANEL" 'Behavior on contentHeight' "fitted editor height changes must be animated"
 require_text "$PANEL" 'animateEditorHeight = false' "dashboard restoration must bypass partial-height clipping"
 require_text "$PANEL" 'panelHeightAnimation\.stop\(\)' "dashboard restoration must stop an in-flight editor contraction"
@@ -77,7 +92,41 @@ require_text "$PANEL" 'duration: 140; easing\.type: Easing\.OutCubic' "content a
 require_text "$PANEL" 'enabled:[[:space:]]*root\.editorMode === "normal"' "fading dashboard must stop pointer handling in editors"
 require_text "$PANEL" 'enabled:[[:space:]]*root\.editorMode !== "normal"' "fading editors must stop pointer handling on the dashboard"
 require_text "$PANEL" 'scrollFocusedEditorControl' "editor keyboard focus must remain visible in capped panels"
-require_text "$PANEL" 'duration: 160; easing\.type: Easing\.OutCubic' "rail/value transitions must use 160 ms OutCubic"
+require_text "$PANEL" 'duration: 160; easing\.type: Easing\.OutCubic' "value transitions must use 160 ms OutCubic"
+require_text "$PANEL" 'DaylightTimeline[[:space:]]*\{' "dashboard must instantiate the reusable civil timeline"
+require_text "$PANEL" 'snapshot:[[:space:]]*root\.timelineSnapshot' "Timeline must receive the complete atomic Service snapshot"
+require_text "$PANEL" 'moonPhase:[[:space:]]*root\.moonPhaseSnapshot' "Timeline must receive the complete lunar Service snapshot"
+require_text "$PANEL" 'timelineSnapshot:[[:space:]]*serviceValue\("timeline", null\)' "Panel must consume the Service timeline directly"
+require_text "$PANEL" 'timelineDisplayTimes:[[:space:]]*timelineSnapshot' "hero display times must stay in the timeline transaction"
+require_text "$PANEL" 'formatProjectedTime\(projectedDisplayTime\("sunset"\)' "sunset hero copy must use projected displayTimes"
+require_text "$PANEL" 'formatProjectedTime\(projectedDisplayTime\("sunrise"\)' "sunrise hero copy must use projected displayTimes"
+require_text "$PANEL" 'var wall = new Date\(1970, 0, 1, hours, minutes, seconds, milliseconds\)' "projected labels must format civil wall fields only"
+reject_text "$PANEL" 'Qt\.formatTime\(new Date\(value\)' "Panel must not format schedule epochs in the shell timezone"
+reject_text "$PANEL" 'railProgress|id:[[:space:]]*railTrack|text:[[:space:]]*"SUNSET|text:[[:space:]]*"SUNRISE' "old sunset-to-sunrise static rail must be removed"
+
+# Exact normal roving order: Timeline, Automatic, Warmth, Transition, primary,
+# Location, Forget. Automatic remains initial when the panel opens.
+require_text "$PANEL" 'root\.focusIndex = 1' "open must initially focus Automatic"
+require_text "$PANEL" 'if \(focusIndex === 0\) item = daylightTimeline' "Timeline must lead normal roving order"
+require_text "$PANEL" 'else if \(focusIndex === 1\) item = automaticRow' "Automatic must follow Timeline"
+require_text "$PANEL" 'else if \(focusIndex === 2\) item = warmthRow' "Warmth roving index changed"
+require_text "$PANEL" 'else if \(focusIndex === 3\) item = transitionRow' "Transition roving index changed"
+require_text "$PANEL" 'else if \(focusIndex === 4\) item = primaryAction' "primary action roving index changed"
+require_text "$PANEL" 'else if \(focusIndex === 5\) item = locationAction' "Location roving index changed"
+require_text "$PANEL" 'hasCursor:[[:space:]]*root\.focusIndex === 6' "Forget must end normal roving order"
+require_text "$PANEL" 'daylightTimeline\.moveSelection\(direction\)' "Timeline Left/Right selection routing is missing"
+require_text "$PANEL" 'daylightTimeline\.activateSelection\(\)' "Timeline Enter/Space activation routing is missing"
+require_text "$PANEL" 'daylightTimeline\.clearPin\(\)' "panel close must clear the Timeline pin"
+require_text "$PANEL" 'onFocusRequested:[[:space:]]*root\.setFocus\(0\)' "Timeline pointer entry must join roving focus"
+require_text "$PANEL" 'sourceRowControl:[[:space:]]*sourceRow' "integration tests need the real source-row collision bound"
+require_text "$PANEL" 'automaticRowControl:[[:space:]]*automaticRow' "integration tests need the real Automatic-row collision bound"
+require_text "$TIMELINE" '_detailLaneHeight:[[:space:]]*height / 2' "event detail must reserve explicit lanes inside the fixed slot"
+require_text "$TIMELINE" '_detailAvailableWidth\(eventX\)' "event detail must choose bounded horizontal space beside its target"
+require_text "$TIMELINE" 'return event && event\.kind === "sunrise" \? 0 : height - heightValue' "sunrise/sunset detail must remain in internal upper/lower lanes"
+require_text "$TIMELINE" 'width:[[:space:]]*Math\.min\(naturalWidth, root\._detailAvailableWidth\(eventX\)\)' "pinned detail must stay horizontally bounded"
+require_text "$ROOT/test/qml-entrypoints-test.sh" 'detail remains wholly inside the fixed Timeline slot' "entrypoint test must assert full Panel detail bounds"
+require_text "$ROOT/test/qml-entrypoints-test.sh" 'detail does not obscure the source row' "entrypoint test must cover source-row collisions"
+require_text "$ROOT/test/qml-entrypoints-test.sh" 'detail does not obscure Automatic/On' "entrypoint test must cover Automatic-row collisions"
 
 for copy in \
   'Choose a location' \

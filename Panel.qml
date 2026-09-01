@@ -20,7 +20,9 @@ Panel {
     ? bar.shell.serviceFor("jgordijn.night-light") : null
 
   property string editorMode: "normal" // normal, location, manual, consent, auto, forget, stock
-  property int focusIndex: 0
+  // Timeline leads the normal roving order, while Automatic remains the
+  // keyboard-open starting point.
+  property int focusIndex: 1
   property int editorFocusIndex: 0
   property int resultIndex: 0
   property bool manualTouched: false
@@ -33,6 +35,9 @@ Panel {
   readonly property int nominalContentHeight: Style.space(440)
   readonly property var keyboardPanel: panel
   readonly property Item normalKeyboardTarget: keyCatcher
+  readonly property Item timelineControl: daylightTimeline
+  readonly property Item sourceRowControl: sourceRow
+  readonly property Item automaticRowControl: automaticRow
   readonly property var editorViewport: editorScroll
   // The dashboard deliberately keeps its full composition. Editors instead
   // fit their laid-out content, up to the same screen-aware maximum.
@@ -171,14 +176,13 @@ Panel {
   }
   readonly property bool actualWarm: actualState && String(actualState.kind) === "temperature" && actualTemperature < 6500
 
-  readonly property real sunsetMs: Number(serviceValue("sunset", 0)) || 0
-  readonly property real sunriseMs: Number(serviceValue("sunrise", 0)) || 0
-  readonly property real nextBoundaryMs: Number(serviceValue("nextBoundary", 0)) || 0
-  readonly property real overrideUntilMs: Number(serviceValue("overrideUntil", 0)) || 0
-  readonly property real railProgress: {
-    if (!(sunsetMs > 0 && sunriseMs > sunsetMs)) return 0
-    return Math.max(0, Math.min(1, (Date.now() - sunsetMs) / (sunriseMs - sunsetMs)))
-  }
+  // Service publishes each civil-day timeline as one immutable transaction.
+  // Keep that object intact through the panel/component boundary; do not mix
+  // its marker, events, zone, or display labels with stable IPC epochs.
+  readonly property var timelineSnapshot: serviceValue("timeline", null)
+  readonly property var moonPhaseSnapshot: serviceValue("moonPhase", null)
+  readonly property var timelineDisplayTimes: timelineSnapshot && timelineSnapshot.displayTimes
+    ? timelineSnapshot.displayTimes : null
 
   readonly property string stateTitle: {
     if (runtimeMode === "loading") return "Loading Night Light"
@@ -200,19 +204,18 @@ Panel {
     if (backendError) return "hyprsunset did not respond. Your schedule is still saved."
     if (calculationError) return "The last display setting was left unchanged."
     if (overridden) {
-      var resumeAt = overrideUntilMs > 0 ? overrideUntilMs : nextBoundaryMs
-      if (!(resumeAt > 0)) return "Manual setting is active. Choose a location to resume automatically."
+      var resumeAt = projectedDisplayTime("overrideUntil") || projectedDisplayTime("nextBoundary")
       var boundaryName = (phase === "night" || phase === "morning-transition" || phase === "polar-night") ? "sunrise" : "sunset"
-      return "Automatic resumes at " + boundaryName + " · " + formatTime(resumeAt)
+      return "Automatic resumes at " + boundaryName + " · " + formatProjectedTime(resumeAt)
     }
     if (locationStateError) return errorState && errorState.message ? String(errorState.message) : "The saved location could not be read."
     if (runtimeMode === "setup") return "Needed only to calculate sunrise and sunset."
-    if (phase === "evening-transition") return nightTemperature + " K by " + formatTime(nextBoundaryMs)
-    if (phase === "night") return "Sunrise at " + formatTime(sunriseMs > 0 ? sunriseMs : nextBoundaryMs)
-    if (phase === "morning-transition") return "Daylight by " + formatTime(nextBoundaryMs)
+    if (phase === "evening-transition") return nightTemperature + " K by " + formatProjectedTime(projectedDisplayTime("nextBoundary"))
+    if (phase === "night") return "Sunrise at " + formatProjectedTime(projectedDisplayTime("sunrise") || projectedDisplayTime("nextBoundary"))
+    if (phase === "morning-transition") return "Daylight by " + formatProjectedTime(projectedDisplayTime("nextBoundary"))
     if (phase === "polar-day") return "Daylight until the next calculated sunset"
     if (phase === "polar-night") return "Night light until the next calculated sunrise"
-    return "Sunset at " + formatTime(sunsetMs > 0 ? sunsetMs : nextBoundaryMs)
+    return "Sunset at " + formatProjectedTime(projectedDisplayTime("sunset") || projectedDisplayTime("nextBoundary"))
   }
 
   readonly property string heroGlyph: {
@@ -235,9 +238,39 @@ Panel {
     return "Manual"
   }
 
-  function formatTime(epoch) {
-    var value = Number(epoch)
-    return isFinite(value) && value > 0 ? Qt.formatTime(new Date(value), Qt.locale().timeFormat(Locale.ShortFormat)) : "—"
+  function projectedDisplayTime(name) {
+    var times = timelineDisplayTimes
+    if (!times || !(name in times)) return null
+    var value = times[name]
+    return value && typeof value === "object" ? value : null
+  }
+
+  function projectedOffsetText(minutes) {
+    var value = Number(minutes)
+    if (!isFinite(value)) return ""
+    var sign = value < 0 ? "−" : "+"
+    var absolute = Math.abs(Math.round(value))
+    var hours = Math.floor(absolute / 60)
+    var mins = absolute % 60
+    return "UTC" + sign + (hours < 10 ? "0" : "") + hours + ":" +
+      (mins < 10 ? "0" : "") + mins
+  }
+
+  function formatProjectedTime(projected) {
+    if (!projected) return "—"
+    var value = Number(projected.wallMs)
+    if (!isFinite(value) || value < 0 || value >= 86400000) return "—"
+    var hours = Math.floor(value / 3600000)
+    var minutes = Math.floor((value % 3600000) / 60000)
+    var seconds = Math.floor((value % 60000) / 1000)
+    var milliseconds = Math.floor(value % 1000)
+    // Format only controller-projected wall fields. The projected epoch is
+    // deliberately ignored so the shell timezone cannot relabel this event.
+    var wall = new Date(1970, 0, 1, hours, minutes, seconds, milliseconds)
+    var text = Qt.formatTime(wall, Qt.locale().timeFormat(Locale.ShortFormat))
+    if (projected.ambiguous === true)
+      text += " · " + projectedOffsetText(projected.offsetMinutes)
+    return text
   }
 
   function ageText(observedAt) {
@@ -256,13 +289,34 @@ Panel {
   function persistSettings(values) {
     var entry = { id: root.moduleName }
     var serviceEntry = serviceValue("inlineSettings", null)
-    for (var serviceKey in serviceEntry) if (serviceKey !== "id") entry[serviceKey] = serviceEntry[serviceKey]
-    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    if (serviceEntry) {
+      for (var serviceKey in serviceEntry)
+        if (serviceKey !== "id") entry[serviceKey] = serviceEntry[serviceKey]
+    }
+
+    // Panel may persist Automatic, Transition, or presentation metadata, but
+    // Warmth is Service-owned. Never let a stale per-panel/host snapshot (or a
+    // generic caller) replace the canonical committed nightTemperature.
+    if (root.settings) {
+      for (var existing in root.settings)
+        if (existing !== "id" && existing !== "nightTemperature") entry[existing] = root.settings[existing]
+    }
+    var canonicalTemperature = serviceEntry ? serviceEntry.nightTemperature : undefined
+    if (!(typeof canonicalTemperature === "number" && isFinite(canonicalTemperature) &&
+          Math.floor(canonicalTemperature) === canonicalTemperature &&
+          canonicalTemperature >= 1000 && canonicalTemperature <= 6500))
+      canonicalTemperature = serviceValue("nightTemperature", undefined)
+    if (!(typeof canonicalTemperature === "number" && isFinite(canonicalTemperature) &&
+          Math.floor(canonicalTemperature) === canonicalTemperature &&
+          canonicalTemperature >= 1000 && canonicalTemperature <= 6500)) return false
+    entry.nightTemperature = canonicalTemperature
+
     var serviceStock = serviceValue("stockIndicator", null)
     var localStock = entry.stockIndicator
     if (serviceStock && serviceStock.choice && (!localStock || localStock.choice === "pending") && serviceStock.choice !== "pending")
       entry.stockIndicator = serviceStock
-    for (var key in values) entry[key] = values[key]
+    for (var key in values)
+      if (key !== "id" && key !== "nightTemperature") entry[key] = values[key]
     root.settings = entry
     if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
@@ -274,8 +328,16 @@ Panel {
   }
 
   function stepWarmth(direction) {
-    var next = Math.max(1000, Math.min(6500, nightTemperature + (direction < 0 ? -250 : 250)))
-    if (next !== nightTemperature) persistSettings({ nightTemperature: next })
+    var service = root.nightLightService
+    if (!service || typeof service.stepNightTemperature !== "function") return false
+    // Service owns the complete persisted-first transaction. One UI step is
+    // exactly one canonical service call; a failed/absent service is not faked.
+    var committed = false
+    try { committed = service.stepNightTemperature(direction) === true }
+    catch (exception) { return false }
+    if (!committed) return false
+    syncSettingsFromService()
+    return true
   }
 
   function stepTransition(direction) {
@@ -304,7 +366,7 @@ Panel {
 
   function open() {
     root.controller.show()
-    root.focusIndex = 0
+    root.focusIndex = 1
     Qt.callLater(function() {
       if (!root.opened) return
       root.setCenterHoverRevealSuppressed(true)
@@ -314,9 +376,14 @@ Panel {
 
   function close() {
     setCenterHoverRevealSuppressed(false)
+    daylightTimeline.clearPin()
     cancelEditor(false)
     root.controller.hide()
   }
+
+  // Native popout handoff can close through the inherited Panel path rather
+  // than root.close(); every close path still drops ephemeral event detail.
+  onOpenedChanged: if (!opened) daylightTimeline.clearPin()
 
   function toggle() { opened ? close() : open() }
 
@@ -332,40 +399,43 @@ Panel {
   }
 
   function setFocus(index) {
-    focusIndex = Math.max(0, Math.min(5, index))
+    focusIndex = Math.max(0, Math.min(6, index))
     scrollFocusedControl()
   }
 
   function moveFocus(dx, dy) {
-    if (dy !== 0) setFocus((focusIndex + (dy > 0 ? 1 : 5)) % 6)
+    if (dy !== 0) setFocus((focusIndex + (dy > 0 ? 1 : 6)) % 7)
     else if (dx !== 0) adjustFocused(dx)
   }
 
   function adjustFocused(direction) {
-    if (focusIndex === 0) setAutomatic(direction > 0)
-    else if (focusIndex === 1) stepWarmth(direction)
-    else if (focusIndex === 2) stepTransition(direction)
+    if (focusIndex === 0) daylightTimeline.moveSelection(direction)
+    else if (focusIndex === 1) setAutomatic(direction > 0)
+    else if (focusIndex === 2) stepWarmth(direction)
+    else if (focusIndex === 3) stepTransition(direction)
   }
 
   function activateFocused() {
-    if (focusIndex === 0) setAutomatic(!automaticEnabled)
-    else if (focusIndex === 1) stepWarmth(1)
-    else if (focusIndex === 2) stepTransition(1)
-    else if (focusIndex === 3) {
+    if (focusIndex === 0) daylightTimeline.activateSelection()
+    else if (focusIndex === 1) setAutomatic(!automaticEnabled)
+    else if (focusIndex === 2) stepWarmth(1)
+    else if (focusIndex === 3) stepTransition(1)
+    else if (focusIndex === 4) {
       if (backendError || calculationError) retry()
       else if (overridden) resumeAutomatic()
       else manualNow()
-    } else if (focusIndex === 4) showEditor("location")
+    } else if (focusIndex === 5) showEditor("location")
     else showEditor("forget")
   }
 
   function scrollFocusedControl() {
     var item = null
-    if (focusIndex === 0) item = automaticRow
-    else if (focusIndex === 1) item = warmthRow
-    else if (focusIndex === 2) item = transitionRow
-    else if (focusIndex === 3) item = primaryAction
-    else if (focusIndex === 4) item = locationAction
+    if (focusIndex === 0) item = daylightTimeline
+    else if (focusIndex === 1) item = automaticRow
+    else if (focusIndex === 2) item = warmthRow
+    else if (focusIndex === 3) item = transitionRow
+    else if (focusIndex === 4) item = primaryAction
+    else if (focusIndex === 5) item = locationAction
     else item = forgetAction
     if (!item || !normalScroll) return
     Qt.callLater(function() {
@@ -808,6 +878,7 @@ Panel {
             }
 
             Item {
+              id: sourceRow
               width: parent.width
               height: Style.space(26)
 
@@ -844,66 +915,20 @@ Panel {
               }
             }
 
-            Item {
+            DaylightTimeline {
+              id: daylightTimeline
               width: parent.width
-              height: Style.space(58)
-
-              Text {
-                anchors.left: parent.left
-                anchors.top: parent.top
-                text: "SUNSET  " + root.formatTime(root.sunsetMs)
-                color: root.dimForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 0.8
-              }
-
-              Text {
-                anchors.right: parent.right
-                anchors.top: parent.top
-                text: "SUNRISE  " + root.formatTime(root.sunriseMs)
-                color: root.dimForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                font.letterSpacing: 0.8
-              }
-
-              Rectangle {
-                id: railTrack
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: Style.space(12)
-                height: Style.space(6)
-                radius: Style.cornerRadius > 0 ? height / 2 : 0
-                color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
-
-                Rectangle {
-                  width: Math.round(parent.width * root.railProgress)
-                  height: parent.height
-                  radius: parent.radius
-                  color: Style.selectedStateColor(root.contentForeground, Color.accent)
-                  Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                }
-
-                BorderSurface {
-                  width: Style.space(12)
-                  height: width
-                  radius: width / 2
-                  x: Math.max(0, Math.min(railTrack.width - width, railTrack.width * root.railProgress - width / 2))
-                  anchors.verticalCenter: parent.verticalCenter
-                  color: root.contentForeground
-                  borderSpec: Border.flat(Color.popups.background, Math.max(1, Style.space(2)))
-                  Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                }
-              }
+              snapshot: root.timelineSnapshot
+              moonPhase: root.moonPhaseSnapshot
+              current: root.focusIndex === 0
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onFocusRequested: root.setFocus(0)
             }
 
             ControlRow {
               id: automaticRow
-              controlIndex: 0
+              controlIndex: 1
               label: "AUTOMATIC"
               valueText: root.automaticEnabled ? "On" : "Paused"
               description: root.automaticEnabled ? "Follows sunset and sunrise" : "Scheduled writes are paused"
@@ -913,10 +938,10 @@ Panel {
 
             ControlRow {
               id: warmthRow
-              controlIndex: 1
+              controlIndex: 2
               label: "WARMTH"
               valueText: root.nightTemperature + " K"
-              description: "Night temperature"
+              description: "Saved automatically · Live during automatic warmth"
               decreaseName: "Decrease night warmth"
               increaseName: "Increase night warmth"
               onDecreased: root.stepWarmth(-1)
@@ -926,7 +951,7 @@ Panel {
 
             ControlRow {
               id: transitionRow
-              controlIndex: 2
+              controlIndex: 3
               label: "TRANSITION"
               valueText: root.transitionLabel(root.transitionMinutes)
               description: "At both horizon boundaries"
@@ -939,7 +964,7 @@ Panel {
 
             ActionRow {
               id: primaryAction
-              controlIndex: 3
+              controlIndex: 4
               iconText: root.backendError || root.calculationError ? "󰑐" : (root.overridden ? "󰑓" : (root.actualWarm ? "󰖙" : "󰖔"))
               label: root.backendError || root.calculationError ? "Retry" : (root.overridden ? "Resume automatic" : (root.actualWarm ? "Use daylight" : "Warm now"))
               detail: root.busy ? "Working…" : (root.overridden ? "Return to the calculated schedule" : "Manual until the next solar boundary")
@@ -955,7 +980,7 @@ Panel {
                 id: locationAction
                 width: parent.width - forgetAction.width - parent.spacing
                 height: parent.height
-                controlIndex: 4
+                controlIndex: 5
                 iconText: "󰍎"
                 label: root.runtimeMode === "setup" ? "Choose location" : "Change location"
                 detail: ""
@@ -971,10 +996,10 @@ Panel {
                 tooltipText: "Forget Night Light location"
                 foreground: root.contentForeground
                 hoverColor: root.contentUrgent
-                hasCursor: root.focusIndex === 5
+                hasCursor: root.focusIndex === 6
                 Accessible.name: "Forget Night Light location"
                 Accessible.role: Accessible.Button
-                onHovered: function(hovered) { if (hovered) root.setFocus(5) }
+                onHovered: function(hovered) { if (hovered) root.setFocus(6) }
                 onClicked: root.showEditor("forget")
               }
             }

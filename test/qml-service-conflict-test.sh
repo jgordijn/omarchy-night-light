@@ -8,13 +8,16 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/qml" "$TMP/state/omarchy/settings" "$TMP/runtime"
 chmod 700 "$TMP/runtime"
-cp "$ROOT/Service.qml" "$ROOT/SolarModel.js" "$ROOT/ScheduleModel.js" "$ROOT/LocationModel.js" "$TMP/qml/"
+cp "$ROOT/Service.qml" "$ROOT/SolarModel.js" "$ROOT/ScheduleModel.js" "$ROOT/LocationModel.js" \
+  "$ROOT/TimelineModel.js" "$ROOT/MoonModel.js" "$TMP/qml/"
 
-python - "$TMP/state/omarchy/settings/weather.json" "$TMP/private-state.json" <<'PY'
-import datetime, json, pathlib, sys
-now = datetime.datetime.now(datetime.timezone.utc)
-hours = now.hour + now.minute / 60 + now.second / 3600
-longitude = ((15 * (12 - hours) + 180) % 360) - 180
+# Keep Weather and every manual A/B/C transaction safely in model-verified
+# daytime regardless of the wall-clock phase when this race suite runs.
+FIXTURE_JSON=$(node "$ROOT/test/solar-noon-fixture.cjs")
+DAY_LONGITUDE=$(python -c 'import json,sys; print(json.load(sys.stdin)["longitude"])' <<<"$FIXTURE_JSON")
+python - "$TMP/state/omarchy/settings/weather.json" "$TMP/private-state.json" "$DAY_LONGITUDE" <<'PY'
+import json, pathlib, sys
+longitude = float(sys.argv[3])
 weather = {"name": "Conflict Weather", "latitude": 0, "longitude": longitude}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(weather))
 location = {
@@ -114,6 +117,8 @@ import "."
 
 ShellRoot {
   id: harness
+  readonly property real dayLongitude: Number(Quickshell.env("FAKE_DAY_LONGITUDE"))
+  function manualCoordinates(latitude) { return String(latitude) + ", " + String(dayLongitude) }
   property QtObject fakeShell: QtObject {
     property var shellConfig: ({ version: 1, bar: { layout: { left: [], center: [], right: [{
       id: "jgordijn.night-light", automationEnabled: true, nightTemperature: 4000,
@@ -162,7 +167,7 @@ ShellRoot {
       if (stage === 0 && service && service._initializationInFlight && service._stateBusy) {
         stage = 1
         ticks = 0
-        if (!service.useManualCoordinates("10, 20") || !service._queuedStateWrite) {
+        if (!service.useManualCoordinates(harness.manualCoordinates(10)) || !service._queuedStateWrite) {
           console.error("CONFLICT_TEST_FAIL B not queued")
           Qt.quit()
         }
@@ -216,7 +221,7 @@ ShellRoot {
       if (stage === 5 && service && service._initializationInFlight && service._stateBusy) {
         stage = 6
         ticks = 0
-        if (!service.useManualCoordinates("10, 20") || !service._queuedStateWrite) {
+        if (!service.useManualCoordinates(harness.manualCoordinates(10)) || !service._queuedStateWrite) {
           console.error("CONFLICT_TEST_FAIL combined B not queued")
           Qt.quit()
         }
@@ -226,7 +231,7 @@ ShellRoot {
           service.privateLocationState.revision === 6 && !service._queuedStateWrite) {
         stage = 7
         ticks = 0
-        if (!service.useManualCoordinates("30, 40") || !service._queuedStateWrite ||
+        if (!service.useManualCoordinates(harness.manualCoordinates(30)) || !service._queuedStateWrite ||
             Number(service._queuedStateWrite.candidate.manual.latitude) !== 30) {
           console.error("CONFLICT_TEST_FAIL C not queued behind B")
           Qt.quit()
@@ -239,7 +244,7 @@ ShellRoot {
           service.privateLocationState.revision === 8 && service.privateLocationState.mode === "manual" &&
           service.activeScheduleLocation && service.activeScheduleLocation.source === "manual-coordinates" &&
           Number(service.activeScheduleLocation.latitude) === 30 &&
-          Number(service.activeScheduleLocation.longitude) === 40
+          Math.abs(Number(service.activeScheduleLocation.longitude) - harness.dayLongitude) < 0.000000001
         if (latestCommitted) {
           console.log("CONFLICT_TEST_PASS", JSON.stringify(service.statusObject()))
           Qt.quit()
@@ -261,7 +266,7 @@ set +e
 timeout 15s env \
   HOME="$TMP/home" XDG_STATE_HOME="$TMP/state" XDG_RUNTIME_DIR="$TMP/runtime" \
   FAKE_CONTROLLER_LOG="$TMP/controller.log" FAKE_PRIVATE_STATE="$TMP/private-state.json" \
-  FAKE_CONFLICT_PHASE="$TMP/phase" QT_QPA_PLATFORM=offscreen \
+  FAKE_CONFLICT_PHASE="$TMP/phase" FAKE_DAY_LONGITUDE="$DAY_LONGITUDE" QT_QPA_PLATFORM=offscreen \
   quickshell --no-color -p "$TMP/qml/shell.qml" >"$OUTPUT" 2>&1
 RC=$?
 set -e
@@ -276,9 +281,11 @@ if grep -Eiq 'CONFLICT_TEST_FAIL|TypeError|ReferenceError|is not a type|Cannot a
   exit 1
 fi
 
-python - "$TMP/controller.log" <<'PY'
+python - "$TMP/controller.log" "$DAY_LONGITUDE" <<'PY'
 import json, pathlib, sys
 rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+day_longitude = float(sys.argv[2])
+assert not [row for row in rows if row["operation"] == "setDesired"], rows
 state_ops = [row for row in rows if row["operation"] in ("readLocationState", "writeLocationState")]
 # Case one: startup read(5), A@5 conflicts after an external winner reaches 6,
 # authoritative read(6), then queued manual B is rebased and succeeds at 6.
@@ -288,6 +295,8 @@ assert [row["operation"] for row in state_ops[:4]] == [
 assert state_ops[1]["expectedRevision"] == 5 and state_ops[1]["state"]["mode"] == "weather", state_ops[1]
 assert state_ops[3]["expectedRevision"] == 6 and state_ops[3]["state"]["revision"] == 6, state_ops[3]
 assert state_ops[3]["state"]["mode"] == "manual", state_ops[3]
+assert state_ops[3]["state"]["manual"]["latitude"] == 10, state_ops[3]
+assert abs(state_ops[3]["state"]["manual"]["longitude"] - day_longitude) < 1e-9, state_ops[3]
 assert state_ops[3]["state"]["autoConsentVersion"] == 1, state_ops[3]
 assert state_ops[3]["state"]["weatherCache"]["latitude"] == 20, state_ops[3]
 # Case two has exactly one read/retry after A's conflict. The retry conflict is
@@ -309,8 +318,9 @@ writes = [row for row in third if row["operation"] == "writeLocationState"]
 assert [row["expectedRevision"] for row in writes] == [5, 6, 7], writes
 assert writes[0]["state"]["mode"] == "weather", writes[0]
 assert writes[1]["state"]["manual"]["latitude"] == 10, writes[1]
+assert abs(writes[1]["state"]["manual"]["longitude"] - day_longitude) < 1e-9, writes[1]
 assert writes[2]["state"]["manual"]["latitude"] == 30, writes[2]
-assert writes[2]["state"]["manual"]["longitude"] == 40, writes[2]
+assert abs(writes[2]["state"]["manual"]["longitude"] - day_longitude) < 1e-9, writes[2]
 assert writes[2]["state"]["revision"] == 7, writes[2]
 assert writes[2]["state"]["autoConsentVersion"] == 0, writes[2]
 PY

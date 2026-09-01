@@ -1,10 +1,10 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 15:57 CEST_
+_Last updated: 2026-09-01 16:56 CEST_
 
 ## Status
 
-**UTTERLY WOWED/PASS — final independent installed-output critique complete.**
+**Wave 3 specification frozen; production implementation has not started.**
 
 The Git-managed source checkout and installed clone were independently inspected alongside the installed `/usr/share/omarchy/shell/plugins/panels/clock`. The live service reported a scheduled daytime target with an available backend, no error, and Weather as the active source. Runtime inspection showed one session daemon, one QML attachment, one shared `hyprsunset`, private `0600` state/socket files in `0700` directories, and no plugin-attributable QML warning or coredump.
 
@@ -32,7 +32,25 @@ Live screenshots exercised the installed dashboard, Clock, Escape close, and Tab
 
 After `omarchy plugin update jgordijn.night-light --yes`, the shell was restarted so the keyboard proof used a newly instantiated installed panel rather than the already-running pre-update QML object. The installed `l` shortcut then opened Location (`.work/screens/final-installed-restarted/screenshot-2026-09-01_15-41-02.png`); Escape returned to the dashboard. Shell settings and private state hashes were identical before and after that proof, and Kelvin/identity remained `6500 K`/`true`.
 
-## Final independent blind gate
+## Wave 3 fan-out
+
+`WAVE3-SPEC.md` integrates all four Wave 3 research reports, the three World Clock references, fresh installed Night Light/Clock output, installed shell primitives, current production code, controller protocol, and test harnesses. Contradictions are resolved into one normative build order while `SPEC.md` remains authoritative for every guarantee not explicitly superseded.
+
+| Piece | Status |
+|---|---|
+| Timeline/product/lunar/preview research | Complete |
+| Wave 3 integration contract | **Frozen — `WAVE3-SPEC.md`** |
+| `TimelineModel.js` | Ready to build; not started |
+| `MoonModel.js` | Ready to build; not started |
+| Civil timezone projection and atomic Service timeline | Ready to build; not started |
+| Moon primitive and timeline QML components | Ready to build; not started |
+| Panel timeline/focus integration | Ready to build; not started |
+| Persisted-first Warmth and external-change CAS | Ready to build; not started |
+| Installed-output and five-reviewer blind loop | Blocked on implementation |
+
+No production or test file was changed during specification work.
+
+## Previous independent blind gate
 
 A separate fresh-context critic inspected and used the real Git-managed installed plugin—not a builder summary—and randomized Night Light/Clock ordering across normal, editor, focus, and handoff captures. It explicitly judged **Night Light better overall**, scoring **4.89 vs Clock’s 4.77**, and returned **UTTERLY WOWED/PASS**. Evidence and detailed scoring are in `.work/reports/final-independent-critic.md` and `.work/screens/final-independent-critic/`.
 

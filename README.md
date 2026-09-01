@@ -1,6 +1,6 @@
 # Omarchy Night Light
 
-Night Light is an Omarchy bar widget that smoothly warms the display from calculated sunset to sunrise. Solar times are calculated locally: after a location has been selected, the daily schedule continues to work offline.
+Night Light is an Omarchy bar widget that smoothly warms the display from calculated sunset to sunrise. Its dashboard includes a truthful 24-hour local-civil-day timeline with sunrise, sunset, current time, and a lunar phase marker at night. Solar times and lunar phase are calculated locally: after a location has been selected, the daily schedule continues to work offline.
 
 It uses the session's existing `hyprsunset` when possible and coexists with Omarchy's first-party Night Light service. It does not disable that service, kill a shared daemon, or change Omarchy Weather.
 
@@ -23,6 +23,8 @@ Omarchy validates and clones the plugin to:
 ```
 
 The widget is added to the right side of the bar. Installation runs no install hook, uses no `sudo`, installs no system package, performs no location lookup, and makes no change to systemd or the first-party `omarchy.nightlight` service.
+
+The cloned package ships the pure `TimelineModel.js` and `MoonModel.js` models plus the reusable `DaylightTimeline.qml` and `MoonPhaseIcon.qml` renderers. They require no generated asset, icon file, network provider, or additional package.
 
 To review a checkout before enabling it, omit `--enable`, inspect the files, then run:
 
@@ -47,20 +49,21 @@ On first open, Night Light may also offer to hide the stock `NightLight` shortcu
 
 ## Use
 
-The panel shows the current phase, actual display state, next solar transition, location source, warmth, and transition duration.
+The panel shows the current phase, actual display state, next solar transition, location source, warmth, and transition duration. The timeline maps the selected location’s civil day from midnight to midnight, including DST days; hover or focus reveals real sunrise and sunset events. At night its marker depicts the current lunar phase, not a claim that the Moon is visible or above the horizon.
 
 ### Pointer controls
 
 - **Left click:** open or close the panel.
 - **Right click:** switch immediately between manual warmth and daylight.
 - **Middle click:** resume the automatic solar schedule.
+- **Timeline event:** hover to reveal its projected local time; left-click to pin it, click another to transfer the pin, or click the pinned event again to unpin it.
 
 A manual choice is held until the next sunset or sunrise. Changes made through Omarchy's stock shortcut, `omarchy toggle nightlight`, a native `hyprsunset` profile, or direct `hyprctl` are adopted as manual overrides instead of being fought by the plugin. Select **Resume automatic** to return immediately to the calculated target.
 
 ### Settings
 
 - **Automatic:** pause or resume scheduled changes.
-- **Warmth:** night temperature from 1000 K to 6500 K; default 4000 K. The panel changes it in 250 K steps.
+- **Warmth:** night temperature from 1000 K to 6500 K; default 4000 K. The panel changes it in 250 K steps. Each step is saved automatically and applies live when automatic warmth is active; closing the panel does not roll it back.
 - **Transition:** instant or a gradual sunset/dawn transition; default 45 minutes.
 - **Location:** switch source, search, enter coordinates, or forget the saved Night Light location.
 
@@ -69,13 +72,15 @@ A manual choice is held until the next sunset or sunrise. Changes made through O
 With the panel open:
 
 - `Up`/`Down` or `k`/`j`: move between controls.
-- `Left`/`Right`: change the focused value.
-- `Enter` or `Space`: activate the focused control.
+- `Left`/`Right`: change the focused value; on **Timeline**, select the previous or next real solar event without wrapping.
+- `Enter` or `Space`: activate the focused control; on **Timeline**, pin or unpin the selected event.
 - `n`: use warmth/daylight now.
 - `a`: resume automatic mode.
 - `l`: open the location editor.
 - `Tab`/`Shift+Tab`: move to adjacent visible bar panels; inside an editor, move between editor controls.
-- `Escape`: cancel the editor or close the panel.
+- `Escape`: cancel the editor or close the panel immediately. Closing also clears a pinned timeline event.
+
+Normal focus order is **Timeline → Automatic → Warmth → Transition → primary action → Location → Forget**. Opening starts on **Automatic**; press `Up`/`k` once to reach Timeline.
 
 ### Diagnostics and control
 

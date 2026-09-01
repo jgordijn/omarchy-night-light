@@ -15,6 +15,10 @@ command -v jq >/dev/null 2>&1 || fail "jq is required"
 command -v omarchy >/dev/null 2>&1 || fail "omarchy is required"
 [[ -f $MANIFEST ]] || fail "manifest.json is missing"
 [[ -f $README ]] || fail "README.md is missing"
+for artifact in TimelineModel.js MoonModel.js DaylightTimeline.qml MoonPhaseIcon.qml; do
+  [[ -f $ROOT/$artifact ]] || fail "packaged Wave 3 runtime artifact is missing: $artifact"
+  grep -Fq -- "$artifact" "$README" || fail "README package copy omits $artifact"
+done
 
 EXPECTED=$(cat <<'JSON'
 {
@@ -65,6 +69,14 @@ grep -Fq -- 'The read-only status call is:' "$README" ||
   fail "README must identify status as the read-only IPC command"
 grep -Fq -- 'The remaining calls can change the display setting:' "$README" ||
   fail "README must distinguish mutating IPC controls from status"
+grep -Fq -- '24-hour local-civil-day timeline' "$README" ||
+  fail "README must describe the civil-day timeline"
+grep -Fq -- 'not a claim that the Moon is visible or above the horizon' "$README" ||
+  fail "README must not imply lunar visibility"
+grep -Fq -- 'Timeline → Automatic → Warmth → Transition → primary action → Location → Forget' "$README" ||
+  fail "README must document the normal roving order"
+grep -Fq -- 'Each step is saved automatically and applies live when automatic warmth is active' "$README" ||
+  fail "README must explain persisted-first Warmth behavior"
 
 for doc in "$ROOT"/*.md; do
   if grep -Eq -- 'omarchy-shell[[:space:]]+shell[[:space:]]+call([[:space:]]|$)' "$doc"; then
