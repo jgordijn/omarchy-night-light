@@ -69,7 +69,7 @@ A manual choice is held until the next sunset or sunrise. Changes made through O
 With the panel open:
 
 - `Up`/`Down` or `k`/`j`: move between controls.
-- `Left`/`Right` or `h`/`l`: change the focused value.
+- `Left`/`Right`: change the focused value.
 - `Enter` or `Space`: activate the focused control.
 - `n`: use warmth/daylight now.
 - `a`: resume automatic mode.

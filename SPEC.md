@@ -49,7 +49,7 @@ The absence of a fixed-time fallback is intentional. With no coordinates and no 
 
 ## 3. Package and file boundary
 
-The release contains exactly these production artifacts:
+The Git-managed plugin checkout contains these production entry-point artifacts:
 
 ```text
 manifest.json
@@ -60,11 +60,10 @@ SolarModel.js
 ScheduleModel.js
 LocationModel.js
 Controller.py
-README.md
 LICENSE
 ```
 
-Tests are separate artifacts:
+It also carries `README.md`, this specification, `PROGRESS.md`, and the deterministic tests that validate the installed sources:
 
 ```text
 test/solar-test.cjs
@@ -75,11 +74,10 @@ test/manifest-test.sh
 test/source-contract-test.sh
 test/qml-entrypoints-test.sh
 test/qml-service-test.sh
-test/live-install-test.sh
-test/acceptance-night-light-test.sh
+test/qml-service-conflict-test.sh
 ```
 
-No symlinks, vendored packages, generated assets, icons, shell fragments, or install-time migrations are allowed in v1.
+Omarchy clones the complete Git checkout; only manifest entry points are loaded at runtime. No symlinks, vendored packages, generated assets, icons, shell fragments, or install-time migrations are allowed in v1.
 
 ### Manifest contract
 
@@ -381,7 +379,7 @@ Actual state is one of `unavailable`, `identity`, or `temperature(K)`. Probe onl
 
 Bare `identity` and bare `reset` are forbidden because both write. Apply identity with `identity true`; apply Kelvin with `temperature <integer>`.
 
-The controller has one command in flight and one latest pending desired state. It coalesces intermediate requests, enforces a 5-second minimum temperature-write interval, applies identity immediately at a boundary, verifies every write by probing, and reports errors rather than optimistic success. Command timeout is 2 seconds. Recovery is bounded at immediate, `250 ms`, `1 s`, `2 s`, `5 s`, `10 s`, then 30-second health probes. After three failed applies it stops writing until a successful probe, retaining only the latest target.
+The controller has one command in flight and one latest pending desired state. It coalesces intermediate requests, enforces a 5-second minimum temperature-write interval, applies identity immediately at a boundary, verifies every write by probing, and reports errors rather than optimistic success. Command timeout is 2 seconds. Each desired state receives at most three apply attempts: immediate, after `250 ms`, and after `1 s`. After those fail it stops writing until a successful 30-second health probe, retaining only the latest target.
 
 Discovery is scoped to `HYPRLAND_INSTANCE_SIGNATURE`: inspect the compositor socket and `/proc/<pid>/{exe,environ,stat}`, never global `pgrep`. If IPC works, adopt the existing daemon as shared. If a matching process exists but IPC is starting, wait up to 5 seconds. Only if neither exists may the controller launch:
 
@@ -490,7 +488,7 @@ The open-panel accent mark follows Clock’s desktop-facing edge, dimensions, an
 
 ### `Panel.qml` composition
 
-Use `qs.Ui.Panel`, `KeyboardPanel`, `PanelKeyCatcher`, `PanelActionButton`, `TextField`, `Color`, `Border`, and `Style`. `centerOnBar: true`. Nominal content width is `Style.space(520)` and content height `Style.space(440)`; both use fitted bounds and a Flickable. Height does not change between runtime states or editor modes.
+Use `qs.Ui.Panel`, `KeyboardPanel`, `PanelKeyCatcher`, `PanelActionButton`, `TextField`, `Color`, `Border`, and `Style`. `centerOnBar: true`. Nominal content width is `Style.space(520)` and dashboard content height is `Style.space(440)`; both use screen-aware fitted bounds and a Flickable. Runtime dashboard states keep one stable composition. Editors keep the same width but fit the active editor’s laid-out content up to the dashboard cap.
 
 Visual hierarchy:
 
@@ -500,7 +498,7 @@ Visual hierarchy:
 4. Three fixed rows: `AUTOMATIC`, `WARMTH`, `TRANSITION`
 5. Location/action footer
 
-No hardcoded palette, private font, unscaled physical pixels, or color-only state. Use 140 ms OutCubic content transitions and 160 ms rail/value transitions; never animate geometry.
+No hardcoded palette, private font, unscaled physical pixels, or color-only state. Use 140 ms OutCubic content transitions and editor contraction, and 160 ms rail/value transitions. Returning to the taller dashboard is immediate so controls are never exposed through a partially clipped expansion.
 
 Exact primary runtime copy:
 
@@ -526,7 +524,7 @@ Normal actions are `Warm now` or `Use daylight`, `Resume automatic` when overrid
 Normal mode uses a visible roving focus:
 
 - Up/Down or `k/j`: previous/next control row
-- Left/Right or `h/l`: change the focused row’s value
+- Left/Right: change the focused row’s value
 - Enter/Space: activate the focused action
 - `n`: toggle warm/daylight now
 - `a`: Resume automatic
@@ -625,7 +623,7 @@ All gates are release blockers.
 
 - `omarchy plugin validate .` passes; every manifest entry point loads in a minimal Quickshell harness with delayed fake injection and no exception, warning attributable to the plugin, NaN, or invalid geometry.
 - Left/right/top/bottom bars, focused-monitor summon, one-click panel handoff, outside-click close, open accent, and Tab wrapping match Clock.
-- Every defined setup/loading/offline/stale/rate-limit/save/polar/backend/override state renders useful fixed geometry.
+- Every defined setup/loading/offline/stale/rate-limit/save/polar/backend/override state renders useful bounded geometry; dashboard states are stable and editors settle to their tested fitted heights.
 - Full keyboard contract, focus restoration, accessible names/tooltips, 24/32 px targets, and non-color-only state pass at 1×, 1.5×, and 2× in light/dark themes and narrow bounds.
 - Enabling/opening/closing/disabling/re-enabling/removing does not restart Quickshell, add a crash directory, leak FDs, or show sustained RSS growth after warm-up.
 - The first-open stock-shortcut card is tested in both choices; explicit Hide removes only `NightLight`, leaves `omarchy.nightlight` enabled, and compare-and-swap Restore neither loses nor overwrites unrelated Indicator edits.
@@ -666,6 +664,6 @@ Do not ship if any one is true:
 10. First-party/external changes cause oscillation instead of an override.
 11. Shared hyprsunset is killed, its systemd unit is managed, or global `pgrep` decides ownership.
 12. Offline restart loses a valid schedule.
-13. A popup state jumps geometry, clips, traps focus, lacks copy/action, or is materially less polished than Clock.
+13. A popup state clips, traps focus, lacks copy/action, changes geometry outside the documented fitted-editor transition, or is materially less polished than Clock.
 14. Generic install changes Indicators or disables first-party Night Light without explicit consent.
 15. The actual-machine zero-request Weather startup, lifecycle smoke test, and blind gate have not passed.

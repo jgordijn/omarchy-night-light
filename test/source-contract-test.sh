@@ -98,10 +98,14 @@ for copy in \
   require_text "$PANEL" "$copy" "required truthful UI copy is missing: $copy"
 done
 
-for key in 'key === "n"' 'key === "a"' 'key === "l"' 'Qt\.Key_Tab' \
+for key in 'event\.text === "n"' 'event\.text === "a"' 'event\.text === "l"' 'Qt\.Key_Tab' \
            'Qt\.Key_Escape' 'Qt\.Key_Return' 'Qt\.Key_Enter' 'Qt\.Key_Space'; do
   require_text "$PANEL" "$key" "keyboard contract is missing: $key"
 done
+require_text "$PANEL" 'function handleNormalKey\(event\)' "normal mode must own its conflict-free keyboard map"
+require_text "$PANEL" 'focusTarget: root\.editorMode === "normal" \? normalKeys : editorKeys' "normal mode must focus its conflict-free key handler"
+require_text "$PANEL" 'else if \(event\.key === Qt\.Key_Right\) root\.moveFocus\(1, 0\)' "normal Right must adjust without consuming the Location shortcut"
+require_text "$PANEL" 'else if \(event\.text === "l" \|\| event\.text === "L"\) root\.showEditor\("location"\)' "normal l must open Location"
 require_text "$PANEL" 'Accessible\.name' "panel controls must expose accessible names"
 require_text "$PANEL" 'Math\.max\(Style\.space\(28\), Style\.spacing\.controlHeight\)' "small icon actions must retain at least a scaled 28 logical-pixel target"
 require_text "$PANEL" 'height: Style\.space\(4[048]\)' "primary control rows must retain at least a scaled 40 logical-pixel target"

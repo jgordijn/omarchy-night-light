@@ -307,8 +307,10 @@ ShellRoot {
         var dashboardTargetHeight = nightPanel.targetPanelContentHeight
         equal(dashboardTargetHeight, nightPanel.normalPanelContentHeight, "normal dashboard keeps its composed height")
 
-        nightPanel.showEditor("location")
-        equal(fakeService.openEditorCalls, 1, "opening location UI opens service editor")
+        var locationShortcut = ({ key: 0, text: "l", modifiers: 0, accepted: false })
+        nightPanel.handleNormalKey(locationShortcut)
+        equal(locationShortcut.accepted, true, "location shortcut consumes the key")
+        equal(fakeService.openEditorCalls, 1, "l opens the service location editor")
         equal(nightPanel.editorTitle(), "Location", "location chooser renders in fitted viewport")
         check(nightPanel.targetPanelContentHeight < dashboardTargetHeight, "location editor removes the empty lower canvas")
         check(nightPanel.targetPanelContentHeight === nightPanel.editorPanelContentHeight, "location editor height follows laid-out content")

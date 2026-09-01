@@ -452,7 +452,7 @@ Panel {
     manualSearchObservedBusy = false
     autoSearchObservedBusy = false
     resultIndex = 0
-    if (restoreFocus !== false) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    if (restoreFocus !== false) Qt.callLater(function() { normalKeys.forceActiveFocus() })
   }
 
   function useWeather() {
@@ -635,11 +635,25 @@ Panel {
     if (dy !== 0 || dx !== 0) editorTab((dy !== 0 ? dy : dx) > 0 ? 1 : -1)
   }
 
-  Shortcut {
-    sequence: "l"
-    enabled: root.opened && root.editorMode === "normal"
-    context: Qt.WindowShortcut
-    onActivated: root.showEditor("location")
+  // PanelKeyCatcher reserves vim's `l` for rightward adjustment before its
+  // textKey signal can fire. Night Light promises `l` for Location instead,
+  // so normal mode owns its small key map and leaves h/l out of value changes.
+  function handleNormalKey(event) {
+    if (event.key === Qt.Key_Escape) root.close()
+    else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab)
+      root.switchPanel((event.modifiers & Qt.ShiftModifier) || event.key === Qt.Key_Backtab ? -1 : 1)
+    else if (event.key === Qt.Key_Down || event.text === "j") root.moveFocus(0, 1)
+    else if (event.key === Qt.Key_Up || event.text === "k") root.moveFocus(0, -1)
+    else if (event.key === Qt.Key_Right) root.moveFocus(1, 0)
+    else if (event.key === Qt.Key_Left) root.moveFocus(-1, 0)
+    else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)
+      root.activateFocused()
+    else if (event.key === Qt.Key_Delete || event.text === "x" || event.text === "X") root.showEditor("forget")
+    else if (event.text === "n" || event.text === "N") root.manualNow()
+    else if (event.text === "a" || event.text === "A") root.resumeAutomatic()
+    else if (event.text === "l" || event.text === "L") root.showEditor("location")
+    else return
+    event.accepted = true
   }
 
   function activateEditor() {
@@ -697,7 +711,7 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: true
-    focusTarget: root.editorMode === "normal" ? keyCatcher : editorKeys
+    focusTarget: root.editorMode === "normal" ? normalKeys : editorKeys
     contentWidth: panel.fittedContentWidth(root.nominalContentWidth)
     contentHeight: root.targetPanelContentHeight
 
@@ -712,21 +726,20 @@ Panel {
       NumberAnimation { id: panelHeightAnimation; duration: 140; easing.type: Easing.OutCubic }
     }
 
+    Item {
+      id: normalKeys
+      anchors.fill: parent
+      focus: true
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) { root.handleNormalKey(event) }
+    }
+
+    // Retain the native semantic catcher as the content host, but block its
+    // conflicting h/l mapping; normalKeys above owns the complete key map.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editorMode !== "normal"
-      onMoveRequested: function(dx, dy) { root.moveFocus(dx, dy) }
-      onActivateRequested: root.activateFocused()
-      onCloseRequested: root.close()
-      onDeleteRequested: root.showEditor("forget")
-      onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(text) {
-        var key = text.toLowerCase()
-        if (key === "n") root.manualNow()
-        else if (key === "a") root.resumeAutomatic()
-        else if (key === "l") root.showEditor("location")
-      }
+      blocked: true
 
       // Both normal content and every editor occupy the same fitted viewport.
       Item {
