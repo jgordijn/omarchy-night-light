@@ -1,6 +1,6 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 20:53 CEST_
+_Last updated: 2026-09-01 21:03 CEST_
 
 ## Status
 
@@ -72,6 +72,10 @@ The complete output is `.work/final-coherence/all-suites-final.log`. Shell logs 
 
 The requested shell restart did produce a new Quickshell 0.3.1 SIGSEGV (`PID 690387`). It occurred only after `Exiting due to IPC request`; the core/report show all IPC handlers being deregistered, then a main-thread `__dynamic_cast` failure under `QQmlObjectCreator::finalize`/`QQmlComponent::createObject`. Memory was not exhausted, the shell supervisor relaunched successfully, and neither the core nor log names Night Light code. This supports a Quickshell shutdown/object-finalization race, not a proven plugin defect, but it is a real new coredump and is not hidden behind a PASS claim. Core diagnosis was read-only and the extracted temporary core was deleted.
 
-## Final state
+## Final independent gate
 
-Source behavior and all automated suites pass, and installed timeline/lunar/keyboard/Clock evidence is present. The successful old-style pointer hover capture is real installed evidence, but a fresh Hyprland 0.56 programmatic warp did not synthesize hover; no fresh hover PASS is claimed. The Quickshell restart crash is also an explicit unresolved environment/runtime caveat rather than a plugin PASS.
+A separate fresh-context critic reviewed the clean source and installed tree at `567ac67`, exercised the real installed keyboard timeline/pin/handoff flow, independently recalculated the live civil timeline and moon orientation, reran all suites plus isolated fake-backend Warmth coverage, and randomized blind Clock comparisons. Night Light won three of four visual states and the overall comparison.
+
+Verdict: **UTTERLY WOWED/PASS**. Full evidence is in `.work/reports/w3-final-independent-critic.md` and `.work/screens/w3-final-independent-critic/`.
+
+The successful earlier real-pointer hover capture remains valid installed evidence; Hyprland 0.56's later programmatic cursor warp did not synthesize a new client hover event. The Quickshell IPC-restart crash remains an explicitly documented platform caveat, not a plugin runtime failure or a hidden omission from the verdict.
