@@ -507,7 +507,7 @@ The component owns only ephemeral `selectedEventKey` and `pinnedEventKey`. It ow
 - Painted sun/moon: `Style.space(16)` centered on the current wall-time x.
 - Logical `railStart` and `railSpan` are inset by marker radius; marker, event ticks/arrows, and daylight segments share them exactly.
 - Marker tooltip target: at least `Style.space(32)²`.
-- Each event target: at least `Style.space(32)²`; sunrise and sunset targets are vertically displaced so two nearly equal x positions remain separately clickable.
+- Each event target: at least `Style.space(32)²`; sunrise and sunset targets are vertically displaced so two nearly equal x positions remain separately clickable. The target itself is non-painting: selection MUST NOT draw a little rectangular target box.
 - Base/night track: foreground at existing 0.12 alpha.
 - Daylight: `Style.selectedStateColor(foreground, Color.accent)`.
 - Sun: filled selected-state center plus four short cardinal rays, so it remains distinguishable from a full moon without color.
@@ -524,7 +524,7 @@ At rest, each real event has one faint hairline tick. Full glyphs are:
 - sunrise `↑`, from above;
 - sunset `↓`, below.
 
-Full arrows reveal while any of these is true: whole-rail hover, `current`, event hover, or a pin exists. Pinned arrow remains visible and uses selected styling. Arrow alignment stays exact; only hit target and tooltip placement clamp.
+Full arrows reveal while any of these is true: whole-rail hover, `current`, event hover, or a pin exists. Pinned arrow remains visible and uses selected styling. Keyboard selection uses selected arrow color and weight plus the retained whole-row focus cue; it never paints the 32-unit hit-target rectangle. Arrow alignment stays exact; only hit target and tooltip placement clamp.
 
 Ordinary tooltip/pinned copy is exact:
 
@@ -564,7 +564,7 @@ Event selection order is real epoch order, not x order. On first focus choose th
 - `moveSelection(-1|+1)` moves with clamping, does not wrap, and returns whether selection changed.
 - Any other direction returns false.
 - `activateSelection()` toggles the selected pin and returns true only when an event exists.
-- Pointer entry emits `focusRequested()` so Panel can show native focus chrome.
+- Pointer entry emits `focusRequested()` so Panel can show native whole-row focus chrome; that larger cue remains present while the small event targets stay non-painting.
 
 Expose:
 

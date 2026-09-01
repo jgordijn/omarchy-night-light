@@ -791,7 +791,9 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    centerOnBar: true
+    // KeyboardPanel's installed edge-aware mode centers the card on this
+    // actual WidgetButton, then clamps it to the anchor screen.
+    centerOnBar: false
     focusTarget: root.editorMode === "normal" ? keyCatcher : editorKeys
     contentWidth: panel.fittedContentWidth(root.nominalContentWidth)
     contentHeight: root.targetPanelContentHeight

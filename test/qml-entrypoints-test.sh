@@ -62,6 +62,37 @@ ShellRoot {
     if (actual !== expected) fail(message + " expected=" + expected + " actual=" + actual)
   }
   function finite(value) { return isFinite(Number(value)) && Number(value) >= 0 }
+  function clamp(value, low, high) { return Math.max(low, Math.min(value, high)) }
+  function assertIconAnchoredPanel(panel, position) {
+    var origin = panel.cardOrigin
+    var expectedX = 0
+    var expectedY = 0
+    if (position === "bottom") {
+      expectedX = panel.anchorScreenPos.x + panel.anchorW / 2 - panel.contentWidth / 2
+      expectedY = panel.screenH - panel.barH - panel.contentHeight - panel.gap
+    } else if (position === "left") {
+      expectedX = panel.barW + panel.gap
+      expectedY = panel.anchorScreenPos.y + panel.anchorH / 2 - panel.contentHeight / 2
+    } else if (position === "right") {
+      expectedX = panel.screenW - panel.barW - panel.contentWidth - panel.gap
+      expectedY = panel.anchorScreenPos.y + panel.anchorH / 2 - panel.contentHeight / 2
+    } else {
+      expectedX = panel.anchorScreenPos.x + panel.anchorW / 2 - panel.contentWidth / 2
+      expectedY = panel.barH + panel.gap
+    }
+    expectedX = Math.round(clamp(expectedX, panel.margin,
+                                 panel.screenW - panel.contentWidth - panel.margin))
+    expectedY = Math.round(clamp(expectedY, panel.margin,
+                                 panel.screenH - panel.contentHeight - panel.margin))
+    equal(origin.x, expectedX, position + " panel follows installed icon-anchor x contract")
+    equal(origin.y, expectedY, position + " panel follows installed icon-anchor y contract")
+    check(origin.x >= panel.margin &&
+          origin.x + panel.contentWidth <= panel.screenW - panel.margin,
+          position + " panel is horizontally screen-edge clamped")
+    check(origin.y >= panel.margin &&
+          origin.y + panel.contentHeight <= panel.screenH - panel.margin,
+          position + " panel is vertically screen-edge clamped")
+  }
   function itemBounds(item, ancestor) {
     var point = item.mapToItem(ancestor, 0, 0)
     return ({ left: point.x, top: point.y, right: point.x + item.width,
@@ -149,6 +180,7 @@ ShellRoot {
       fakeBar.barSize = fakeBar.vertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
       check(finite(widget.implicitWidth) && finite(widget.implicitHeight), positions[i] + " bar geometry remains finite")
       check(finite(nightPanel.keyboardPanel.cardOrigin.x) && finite(nightPanel.keyboardPanel.cardOrigin.y), positions[i] + " panel origin remains finite")
+      assertIconAnchoredPanel(nightPanel.keyboardPanel, positions[i])
       check(nightPanel.keyboardPanel.contentWidth > 0 && nightPanel.keyboardPanel.contentWidth <= nightPanel.nominalContentWidth, positions[i] + " panel width stays fitted and bounded")
       check(nightPanel.keyboardPanel.contentHeight > 0 && nightPanel.keyboardPanel.contentHeight <= nightPanel.nominalContentHeight, positions[i] + " panel height stays fitted and bounded")
       if (fakeBar.vertical) equal(widget.implicitHeight, Style.bar.iconSlot, positions[i] + " uses one vertical icon slot")
@@ -441,7 +473,13 @@ ShellRoot {
         fakeService.overrideUntil = 0
         equal(nightPanel.focusIndex, 1, "Automatic is the initial normal focus")
         check(nightPanel.keyboardPanel.owner === widget, "KeyboardPanel owner is host widget")
-        check(nightPanel.keyboardPanel.anchorItem !== null, "actual WidgetButton is the anchor")
+        check(nightPanel.anchorItem !== null &&
+              nightPanel.keyboardPanel.anchorItem === nightPanel.anchorItem &&
+              nightPanel.keyboardPanel.anchorItem !== widget,
+              "actual injected WidgetButton is the KeyboardPanel anchor")
+        equal(nightPanel.keyboardPanel.centerOnBar, false,
+              "panel opts into installed edge-aware icon anchoring")
+        assertIconAnchoredPanel(nightPanel.keyboardPanel, "top")
 
         fakeService.initialized = false
         equal(widget.barLabel, "…", "loading remains visible and truthful")

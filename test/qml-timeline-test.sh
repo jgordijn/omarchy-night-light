@@ -245,6 +245,13 @@ ShellRoot {
         check(setTarget.width >= Style.space(32) && setTarget.height >= Style.space(32),
               "sunset target is at least 32 square")
         check(riseTarget.y !== setTarget.y, "event targets are vertically displaced")
+        check(!("color" in riseTarget) && !("borderSpec" in riseTarget) &&
+              !("color" in setTarget) && !("borderSpec" in setTarget),
+              "32 px event targets paint no rectangular selection box")
+        equal(riseTarget.children.length, 1,
+              "sunrise hit target contains only its pointer handler")
+        equal(setTarget.children.length, 1,
+              "sunset hit target contains only its pointer handler")
         var markerTarget = findObject(timeline, "markerTarget")
         check(markerTarget.width >= Style.space(32) && markerTarget.height >= Style.space(32),
               "marker target is at least 32 square")
@@ -310,9 +317,18 @@ ShellRoot {
         timeline.current = true
         equal(timeline._selectedEventKey, harness.normal.events[1].kind + ":" +
               harness.normal.events[1].epochMs + ":120:0", "first-focus epoch selection")
+        var focusChrome = findObject(timeline, "timelineFocusChrome")
+        check(focusChrome && focusChrome.borderTop > 0,
+              "whole-row focus cue remains visible")
+        check(setArrow.font.bold && !riseArrow.font.bold,
+              "selected sunset glyph carries keyboard selection without a target box")
         check(timeline.moveSelection(-1), "left selects sunrise")
+        check(riseArrow.font.bold && !setArrow.font.bold,
+              "selected sunrise glyph carries keyboard selection without a target box")
         check(!timeline.moveSelection(-1), "left clamps")
         check(timeline.moveSelection(1), "right selects sunset")
+        check(setArrow.font.bold && !riseArrow.font.bold,
+              "right restores selected-glyph keyboard clarity")
         check(!timeline.moveSelection(1), "right clamps")
         check(!timeline.moveSelection(0), "invalid direction is ignored")
         check(timeline.activateSelection(), "keyboard activation pins")

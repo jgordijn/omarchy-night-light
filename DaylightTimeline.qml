@@ -386,20 +386,24 @@ Item {
           ? root._railY - height - Style.spacing.xs
           : root._railY + Style.spacing.xs
         text: eventDelegate.sunrise ? "↑" : "↓"
-        color: eventDelegate.pinned
+        color: eventDelegate.pinned || eventDelegate.selected && root.current
           ? Style.selectedStateColor(root.foreground, Color.accent)
-          : (eventTarget.containsMouse || eventDelegate.selected && root.current
+          : (eventTarget.containsMouse
             ? Style.hoverStateColor(root.foreground, Color.accent)
             : root.foreground)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
+        // The selected glyph itself, together with the retained whole-row
+        // focus chrome, carries keyboard selection. The 32 px target below
+        // deliberately paints no small rectangular focus box.
+        font.bold: eventDelegate.selected && root.current
         opacity: root._revealArrows || eventDelegate.pinned ? 1 : 0
         Behavior on opacity {
           NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
         }
       }
 
-      BorderSurface {
+      Item {
         id: eventTarget
         objectName: "eventTarget-" + eventDelegate.modelData.kind + "-" +
           eventDelegate.modelData.key
@@ -407,12 +411,6 @@ Item {
         height: Style.space(32)
         x: Math.max(0, Math.min(root.width - width, eventDelegate.eventX - width / 2))
         y: eventDelegate.sunrise ? 0 : root.height - height
-        color: eventDelegate.selected && root.current
-          ? Style.focusFillFor(root.foreground, Color.accent) : "transparent"
-        borderSpec: eventDelegate.selected && root.current
-          ? Border.controlSpec("focus", root.foreground, Color.accent)
-          : Border.none()
-        radius: Style.cornerRadius
 
         Accessible.role: Accessible.Button
         Accessible.name: (eventDelegate.sunrise ? "Sunrise, " : "Sunset, ") +

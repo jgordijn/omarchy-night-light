@@ -488,7 +488,7 @@ The open-panel accent mark follows Clock’s desktop-facing edge, dimensions, an
 
 ### `Panel.qml` composition
 
-Use `qs.Ui.Panel`, `KeyboardPanel`, `PanelKeyCatcher`, `PanelActionButton`, `TextField`, `Color`, `Border`, and `Style`. `centerOnBar: true`. Nominal content width is `Style.space(520)` and dashboard content height is `Style.space(440)`; both use screen-aware fitted bounds and a Flickable. Runtime dashboard states keep one stable composition. Editors keep the same width but fit the active editor’s laid-out content up to the dashboard cap.
+Use `qs.Ui.Panel`, `KeyboardPanel`, `PanelKeyCatcher`, `PanelActionButton`, `TextField`, `Color`, `Border`, and `Style`. Pass the actual injected `WidgetButton` as `KeyboardPanel.anchorItem` and set `centerOnBar: false`, using the installed KeyboardPanel’s edge-aware placement to center the card under/beside that icon and clamp it to the anchor screen. Nominal content width is `Style.space(520)` and dashboard content height is `Style.space(440)`; both use screen-aware fitted bounds and a Flickable. Runtime dashboard states keep one stable composition. Editors keep the same width but fit the active editor’s laid-out content up to the dashboard cap.
 
 Visual hierarchy:
 

@@ -25,6 +25,16 @@ reject_text() {
   if grep -Eq -- "$pattern" "$file"; then fail "$description"; fi
 }
 
+require_multiline() {
+  local file=$1 pattern=$2 description=$3
+  grep -Pzq -- "$pattern" "$file" || fail "$description"
+}
+
+reject_multiline() {
+  local file=$1 pattern=$2 description=$3
+  if grep -Pzq -- "$pattern" "$file"; then fail "$description"; fi
+}
+
 [[ -f $BAR && -f $PANEL ]] || fail "BarWidget.qml and Panel.qml are required"
 for artifact in "$TIMELINE" "$MOON_ICON" "$TIMELINE_MODEL" "$MOON_MODEL"; do
   [[ -f $artifact ]] || fail "Wave 3 package artifact is missing: $(basename "$artifact")"
@@ -53,7 +63,9 @@ require_text "$PANEL" '^Panel[[:space:]]*\{' "Panel.qml must extend qs.Ui.Panel"
 require_text "$PANEL" 'readonly property var barIdentity: hostWidget \|\| root' "panel must use the host widget as popout identity"
 require_text "$PANEL" 'owner: root\.barIdentity' "KeyboardPanel owner must be the host widget"
 require_text "$PANEL" 'switchPanelFrom\(root\.barIdentity, direction\)' "Tab handoff must use the host widget identity"
-require_text "$PANEL" 'centerOnBar: true' "Night Light panel must center on the bar"
+require_text "$PANEL" 'anchorItem:[[:space:]]*root\.anchorItem' "KeyboardPanel must receive the actual injected WidgetButton"
+require_text "$PANEL" 'centerOnBar:[[:space:]]*false' "Night Light panel must use installed edge-aware icon anchoring"
+reject_text "$PANEL" 'centerOnBar:[[:space:]]*true' "Night Light panel must not center itself on the screen/bar"
 require_text "$PANEL" 'fittedContentWidth\(root\.nominalContentWidth\)' "panel width must use the stable fitted contract"
 require_text "$PANEL" 'normalPanelContentHeight:[[:space:]]*panel\.cappedContentHeight\(nominalContentHeight\)' "normal dashboard must retain its stable full height"
 require_text "$PANEL" 'readonly property Item activeEditorColumn' "editor height must select one active composition"
@@ -121,6 +133,10 @@ require_text "$PANEL" 'onFocusRequested:[[:space:]]*root\.setFocus\(0\)' "Timeli
 require_text "$PANEL" 'sourceRowControl:[[:space:]]*sourceRow' "integration tests need the real source-row collision bound"
 require_text "$PANEL" 'automaticRowControl:[[:space:]]*automaticRow' "integration tests need the real Automatic-row collision bound"
 require_text "$TIMELINE" '_detailLaneHeight:[[:space:]]*height / 2' "event detail must reserve explicit lanes inside the fixed slot"
+require_multiline "$TIMELINE" 'Item\s*\{\s*id:\s*eventTarget\b' "event hit targets must use a non-painting Item"
+reject_multiline "$TIMELINE" 'BorderSurface\s*\{\s*id:\s*eventTarget\b' "event hit targets must not paint a small rectangular focus box"
+require_text "$TIMELINE" 'font\.bold:[[:space:]]*eventDelegate\.selected && root\.current' "selected arrows need a non-color-only keyboard distinction"
+require_multiline "$TIMELINE" 'BorderSurface\s*\{\s*id:\s*focusChrome\b' "whole-row keyboard focus chrome must be retained"
 require_text "$TIMELINE" '_detailAvailableWidth\(eventX\)' "event detail must choose bounded horizontal space beside its target"
 require_text "$TIMELINE" 'return event && event\.kind === "sunrise" \? 0 : height - heightValue' "sunrise/sunset detail must remain in internal upper/lower lanes"
 require_text "$TIMELINE" 'width:[[:space:]]*Math\.min\(naturalWidth, root\._detailAvailableWidth\(eventX\)\)' "pinned detail must stay horizontally bounded"
