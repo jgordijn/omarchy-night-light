@@ -1997,12 +1997,26 @@ class ControllerDaemon:
                 return
             recovered = True
         except Exception:
-            # A failed probe from superseded authority must not downgrade
-            # the replacement's backend state either.
+            # A failed probe from superseded authority must not downgrade or
+            # restart the replacement's backend.  Under current authority,
+            # recover the same way startup/apply does: initialize() first waits
+            # for an existing session daemon and starts one only when none
+            # exists.  This makes an owned hyprsunset disappearing after login
+            # self-healing instead of leaving the widget unavailable forever.
             if not self.observation_is_current(None, epoch, token):
                 return
-            self.backend_ready = False
-            self.backend_error = "backend-unavailable"
+            try:
+                await self._initialize_backend()
+                if not self.observation_is_current(None, epoch, token):
+                    return
+                self.backend_ready = True
+                self.backend_error = None
+                recovered = True
+            except Exception:
+                if not self.observation_is_current(None, epoch, token):
+                    return
+                self.backend_ready = False
+                self.backend_error = "backend-unavailable"
         # Publication is part of the health observation transaction. Bind it
         # to the exact captured apply authority, including None: a health status
         # blocked in output must not consume an ack created later.

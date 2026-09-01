@@ -709,6 +709,26 @@ class BlockedProbeBackend(SlowBackend):
         return self.probed_actual
 
 
+class VanishingBackend(SlowBackend):
+    """Backend whose daemon disappears once, then initialize recreates it."""
+
+    def __init__(self):
+        super().__init__()
+        self.missing = True
+        self.initialize_calls = 0
+
+    async def initialize(self):
+        self.initialize_calls += 1
+        self.missing = False
+        self.actual = controller.Actual("identity", 6500, 100)
+        return self.actual
+
+    async def probe(self, *, publish=True):
+        if self.missing:
+            raise RuntimeError("backend disappeared")
+        return await super().probe(publish=publish)
+
+
 class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     async def wait_until(predicate, timeout=1.0):
@@ -716,6 +736,29 @@ class QueueAndGenerationTests(unittest.IsolatedAsyncioTestCase):
             while not predicate():
                 await asyncio.sleep(0.005)
         await asyncio.wait_for(poll(), timeout)
+
+    async def test_health_restarts_backend_that_disappears_after_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = controller.ControllerDaemon(pathlib.Path(temporary))
+            daemon.backend = VanishingBackend()
+            daemon.backend_ready = True
+            writer = MemoryStreamWriter()
+            client = controller.Client(asyncio.StreamReader(), writer)
+            daemon.activate_client(client)
+
+            await daemon._health_iteration()
+
+            self.assertEqual(daemon.backend.initialize_calls, 1)
+            self.assertTrue(daemon.backend_ready)
+            self.assertIsNone(daemon.backend_error)
+            self.assertEqual(writer.messages(), [{
+                "protocol": 1,
+                "type": "backendStatus",
+                "available": True,
+                "actual": {"kind": "identity", "temperature": 6500, "gamma": 100},
+                "override": None,
+                "error": None,
+            }])
 
     async def test_rate_limit_wait_is_token_aware_and_identity_preempts(self):
         with tempfile.TemporaryDirectory() as temporary:
