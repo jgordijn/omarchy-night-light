@@ -104,8 +104,8 @@ for key in 'event\.text === "n"' 'event\.text === "a"' 'event\.text === "l"' 'Qt
 done
 require_text "$PANEL" 'function handleNormalKey\(event\)' "normal mode must own its conflict-free keyboard map"
 require_text "$PANEL" 'focusTarget: root\.editorMode === "normal" \? keyCatcher : editorKeys' "normal mode must focus its native semantic content host"
-require_text "$PANEL" 'Keys\.onPressed: function\(event\)' "the KeyboardPanel must intercept normal keys before its focused child"
-require_text "$PANEL" 'if \(root\.editorMode === "normal"\) root\.handleNormalKey\(event\)' "the KeyboardPanel must route normal keys through the conflict-free handler"
+require_text "$PANEL" 'Keys\.onPressed: function\(event\)' "the focused native catcher must override its conflicting default map"
+require_text "$PANEL" 'if \(root\.editorMode === "normal"\) root\.handleNormalKey\(event\)' "the focused catcher must route normal keys through the conflict-free handler"
 require_text "$PANEL" 'id: keyCatcher' "the native semantic content host must remain present"
 require_text "$PANEL" 'else if \(event\.key === Qt\.Key_Right\) root\.moveFocus\(1, 0\)' "normal Right must adjust without consuming the Location shortcut"
 require_text "$PANEL" 'else if \(event\.text === "l" \|\| event\.text === "L"\) root\.showEditor\("location"\)' "normal l must open Location"

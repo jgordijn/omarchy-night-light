@@ -715,12 +715,6 @@ Panel {
     focusTarget: root.editorMode === "normal" ? keyCatcher : editorKeys
     contentWidth: panel.fittedContentWidth(root.nominalContentWidth)
     contentHeight: root.targetPanelContentHeight
-    // Observe normal-mode keys before the focused native catcher can consume
-    // h/l as movement. Editor keys remain owned by editorKeys below.
-    Keys.priority: Keys.BeforeItem
-    Keys.onPressed: function(event) {
-      if (root.editorMode === "normal") root.handleNormalKey(event)
-    }
 
     // Only the lower card edge moves on the common top-bar layout; content
     // remains top-aligned, so controls do not reflow underneath the pointer.
@@ -733,12 +727,16 @@ Panel {
       NumberAnimation { id: panelHeightAnimation; duration: 140; easing.type: Easing.OutCubic }
     }
 
-    // Retain the native semantic catcher as the focused content host, but
-    // block its mapping; the parent KeyboardPanel owns the complete key map.
+    // Retain the native semantic catcher as the focused content host, while
+    // overriding its h/l mapping with this panel's complete normal-mode map.
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       blocked: true
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) {
+        if (root.editorMode === "normal") root.handleNormalKey(event)
+      }
 
       // Both normal content and every editor occupy the same fitted viewport.
       Item {
