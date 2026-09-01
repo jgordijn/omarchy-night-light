@@ -1,12 +1,18 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 21:03 CEST_
+_Last updated: 2026-09-01 21:25 CEST_
 
 ## Status
 
 **Wave 3 is implemented. The final coherence source edit is committed, updated, restarted, and verified from the installed checkout.**
 
-The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-light` was the source under review. It is enabled beside installed Clock and, before this edit, was at `2b7a66a` with a clean tree. The source fix is commit `f52a780` (`Keep override boundary labels coherent`). Current production includes the civil timeline, lunar model/renderer, projected event labels, and persisted-first live Warmth transaction.
+The real Git-managed installation at `~/.config/omarchy/plugins/jgordijn.night-light` was the source under review. It is enabled beside installed Clock and, before this edit, was at `2b7a66a` with a clean tree. Current production includes the civil timeline, lunar model/renderer, projected event labels, and persisted-first live Warmth transaction.
+
+## User-feedback polish
+
+Commit `9890105` anchors the popup to the actual Night Light bar button instead of centering it on the screen. The installed `KeyboardPanel` now performs its native top/bottom/left/right placement and screen-edge clamping. The small painted focus boxes around selected sunrise/sunset arrows are gone; their 32-unit hit areas, bold/color selection cue, accessibility action, hover, and pin behavior remain, as does the larger timeline-row keyboard focus cue.
+
+The installed plugin was updated and the shell restarted to instantiate the new placement. Real installed screenshots are `.work/screens/remarks-installed-restarted.png` and `.work/screens/remarks-installed-restarted-arrow.png`. The latter shows the card directly beneath the top-right Night Light icon with no small arrow box. Settings/state hashes remained unchanged, runtime stayed scheduled and healthy, and this restart produced no coredump. Independent review: **WOW/PASS** in `.work/reports/remarks-critic.md`.
 
 ## Proven coherence fix
 
