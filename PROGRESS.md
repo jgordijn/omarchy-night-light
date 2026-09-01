@@ -1,6 +1,6 @@
 # Night Light — live progress
 
-_Last updated: 2026-09-01 15:31 CEST_
+_Last updated: 2026-09-01 15:42 CEST_
 
 ## Status
 
@@ -10,9 +10,9 @@ The Git-managed source checkout and installed clone were independently inspected
 
 ## Final fix
 
-Actual keyboard exercise exposed a contract conflict: stock `PanelKeyCatcher` consumes `l` as Right before Night Light can use its documented Location shortcut. This also caused an unnecessary inline settings write. Normal mode now owns a conflict-free key map: `l` opens Location and Left/Right alone adjust values. The accidental no-op settings key from the live reproduction was removed again; saved location, stock-indicator metadata, and display target were retained.
+Actual keyboard exercise exposed a contract conflict: stock `PanelKeyCatcher` consumes `l` as Right before Night Light can use its documented Location shortcut. This also caused an unnecessary inline settings write. Normal mode now uses a direct, conflict-free focus owner: `l` opens Location and Left/Right alone adjust values. The accidental no-op settings key from each live reproduction was removed again; saved location, stock-indicator metadata, and display target were retained.
 
-The QML harness now invokes the real normal-key handler and asserts that `l` is consumed by the Location editor. Source-contract coverage prevents reintroducing `l` as normal-mode Right. README and SPEC keyboard copy now agree with runtime behavior. SPEC was also reconciled with the fitted editor geometry, bounded apply retry sequence, and actual tracked test inventory.
+The QML harness now invokes the real normal-key handler and asserts that `l` is consumed by the Location editor. Source-contract coverage prevents reintroducing `PanelKeyCatcher` or `l` as normal-mode Right. README and SPEC keyboard copy now agree with runtime behavior. SPEC was also reconciled with the fitted editor geometry, bounded apply retry sequence, and actual tracked test inventory.
 
 ## Verification
 
@@ -29,6 +29,8 @@ All repository suites pass on the final working tree:
 - QML service conflict/CAS: PASS
 
 Live screenshots exercised the installed dashboard, Clock, Escape close, and Tab handoff to the adjacent Tailscale panel. A real pointer hover over the Night Light bar item showed native hand-cursor affordance. Same-scale Clock and Night Light captures were also placed in a randomized A/B composite at `.work/screens/final/blind-ab.png`.
+
+After `omarchy plugin update jgordijn.night-light --yes`, the shell was restarted so the keyboard proof used a newly instantiated installed panel rather than the already-running pre-update QML object. The installed `l` shortcut then opened Location (`.work/screens/final-installed-restarted/screenshot-2026-09-01_15-41-02.png`); Escape returned to the dashboard. Shell settings and private state hashes were identical before and after that proof, and Kelvin/identity remained `6500 K`/`true`.
 
 ## Gate accounting
 
